@@ -67,6 +67,7 @@ fn pool(
     LocalSandboxPool::new(
         SandboxPoolKey {
             pool_id: "sandbox-pool-e2e".to_string(),
+            recipe_id: "command-seeder".to_string(),
             spec: SandboxSpec {
                 image: SANDBOX_IMAGE.to_string(),
                 resources: Default::default(),

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -8,10 +9,26 @@ use exoharness::{
     CreateSandboxRequest, RunInSandboxRequest, SandboxHandle, SandboxId, SecretId, SnapshotId,
 };
 use futures::io::AsyncReadExt;
+use tokio::time;
 
 #[async_trait]
 pub trait SecretResolver: Send + Sync {
     async fn resolve_key(&self, secret_id: &SecretId) -> Result<String>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecipePolicy {
+    pub command_timeout: Duration,
+    pub max_output_bytes: usize,
+}
+
+impl Default for RecipePolicy {
+    fn default() -> Self {
+        Self {
+            command_timeout: Duration::from_secs(300),
+            max_output_bytes: 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,11 +61,24 @@ pub enum SandboxRecipeStep {
 pub struct RecipeService {
     sandbox: Arc<dyn SandboxHandle>,
     secrets: Arc<dyn SecretResolver>,
+    policy: RecipePolicy,
 }
 
 impl RecipeService {
     pub fn new(sandbox: Arc<dyn SandboxHandle>, secrets: Arc<dyn SecretResolver>) -> Self {
-        Self { sandbox, secrets }
+        Self::new_with_policy(sandbox, secrets, RecipePolicy::default())
+    }
+
+    pub fn new_with_policy(
+        sandbox: Arc<dyn SandboxHandle>,
+        secrets: Arc<dyn SecretResolver>,
+        policy: RecipePolicy,
+    ) -> Self {
+        Self {
+            sandbox,
+            secrets,
+            policy,
+        }
     }
 
     /// Create a sandbox an run a setup recipe
@@ -182,26 +212,18 @@ impl RecipeService {
             })
             .await?;
         let parts = process.into_parts();
-        let (mut stdout, mut stderr) = (parts.stdout, parts.stderr);
-        let (stdout, stderr, exit_code) = tokio::try_join!(
-            async {
-                let mut output = Vec::new();
-                stdout
-                    .read_to_end(&mut output)
-                    .await
-                    .map(|_| output)
-                    .map_err(anyhow::Error::from)
-            },
-            async {
-                let mut output = Vec::new();
-                stderr
-                    .read_to_end(&mut output)
-                    .await
-                    .map(|_| output)
-                    .map_err(anyhow::Error::from)
-            },
-            parts.wait,
-        )?;
+        let (stdout, stderr) = (parts.stdout, parts.stderr);
+        let max_output_bytes = self.policy.max_output_bytes;
+        let command_result = time::timeout(self.policy.command_timeout, async move {
+            tokio::try_join!(
+                read_output(stdout, max_output_bytes, "stdout"),
+                read_output(stderr, max_output_bytes, "stderr"),
+                parts.wait,
+            )
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("recipe command timed out"))?;
+        let (stdout, stderr, exit_code) = command_result?;
         drop(stdout);
         if exit_code != 0 {
             bail!(
@@ -210,6 +232,25 @@ impl RecipeService {
             );
         }
         Ok(())
+    }
+}
+
+async fn read_output(
+    mut reader: exoharness::BoxAsyncRead,
+    max_bytes: usize,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(read) > max_bytes {
+            bail!("recipe command {stream_name} exceeded {max_bytes} output bytes");
+        }
+        output.extend_from_slice(&buffer[..read]);
     }
 }
 

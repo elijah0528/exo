@@ -9,6 +9,7 @@ mod naming_tests;
 mod render;
 #[cfg(test)]
 mod repl_tests;
+mod sandbox_pool_tui;
 #[cfg(test)]
 mod secret_tests;
 mod tools;
@@ -584,6 +585,11 @@ enum Commands {
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommands,
+    },
+    /// Inspect and operate a managed sandbox pool in a terminal UI.
+    SandboxPool {
+        #[command(flatten)]
+        args: sandbox_pool_tui::SandboxPoolArgs,
     },
     /// Manage local stored secrets.
     Secret {
@@ -1200,6 +1206,9 @@ async fn main() -> Result<()> {
         #[cfg(not(feature = "firecracker"))]
         bail!("Firecracker bridge support requires building Exo with --features firecracker");
     }
+    if let Commands::SandboxPool { args } = &cli.command {
+        return sandbox_pool_tui::run(&cli.root, args.clone()).await;
+    }
     let exo_config = build_exo_config(&cli)?;
     let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
     let runtime_config = env.braintrust_runtime_config(
@@ -1252,6 +1261,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::FirecrackerBridge => {
             unreachable!("Firecracker bridge returns before harness startup")
+        }
+        Commands::SandboxPool { .. } => {
+            unreachable!("sandbox pool returns before harness startup")
         }
         Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
@@ -2966,6 +2978,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
         Commands::Secret { .. }
         | Commands::FirecrackerBridge
+        | Commands::SandboxPool { .. }
         | Commands::Sandbox { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
