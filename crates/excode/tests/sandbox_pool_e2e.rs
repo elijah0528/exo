@@ -24,6 +24,7 @@ use exoharness::{
     SandboxNetworkPolicy, SandboxProvider, SandboxSpec,
 };
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::{self, timeout};
 
 const SANDBOX_IMAGE: &str = "docker.io/library/ubuntu:24.04";
@@ -79,8 +80,7 @@ fn pool(
         },
         backend,
         PoolCapacity {
-            min_ready: 0,
-            target_ready: 2,
+            warm_size: 2,
             max_total: 2,
             lease_ttl: Duration::from_secs(60),
             idle_ttl: Duration::from_secs(120),
@@ -102,17 +102,9 @@ impl SandboxPoolProvisioner for CommandSeeder {
     ) -> exoharness::Result<Arc<dyn exoharness::ManagedSandboxHandle>> {
         let sandbox = backend.acquire(request.clone()).await?;
         let output = sandbox
-            .exec(&SandboxCommand {
-                argv: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "printf recipe-seeded > /tmp/exo-pool-recipe-marker".to_string(),
-                ],
-                env: HashMap::new(),
-                display_argv: None,
-                cwd: None,
-                timeout: Some(Duration::from_secs(20)),
-            })
+            .exec(&shell_command(
+                "printf recipe-seeded > /tmp/exo-pool-recipe-marker",
+            ))
             .await?;
         if !output.ok {
             backend.terminate(request).await?;
@@ -122,19 +114,18 @@ impl SandboxPoolProvisioner for CommandSeeder {
     }
 }
 
-/// Helper to print out a value for testing
-fn command(value: &str) -> SandboxCommand {
+fn shell_command(script: impl Into<String>) -> SandboxCommand {
     SandboxCommand {
-        argv: vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            format!("printf '{value}'"),
-        ],
+        argv: vec!["/bin/sh".to_string(), "-c".to_string(), script.into()],
         env: HashMap::new(),
         display_argv: None,
         cwd: None,
         timeout: Some(Duration::from_secs(20)),
     }
+}
+
+fn command(value: &str) -> SandboxCommand {
+    shell_command(format!("printf '{value}'"))
 }
 
 fn running_docker_container(sandbox: &dyn ManagedSandboxCapability) -> String {
@@ -177,25 +168,53 @@ async fn acquire(
     (acquired.lease, acquired.sandbox)
 }
 
+struct RunningPool {
+    pool: Arc<LocalSandboxPool>,
+    shutdown: watch::Sender<bool>,
+    reconciler: JoinHandle<()>,
+}
+
+impl RunningPool {
+    fn start(pool: LocalSandboxPool) -> Self {
+        let pool = Arc::new(pool);
+        let (shutdown, receiver) = watch::channel(false);
+        let reconciler = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.run_reconciler(receiver).await }
+        });
+        Self {
+            pool,
+            shutdown,
+            reconciler,
+        }
+    }
+
+    async fn stop(self) {
+        self.pool.drain().await.unwrap();
+        assert_eq!(self.pool.entry_count().await, 0);
+        self.shutdown.send(true).unwrap();
+        time::timeout(Duration::from_secs(10), self.reconciler)
+            .await
+            .expect("reconciler should stop")
+            .expect("reconciler task should not panic");
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns real local-process or Docker sandboxes; CI runs ignored integration tests"]
 async fn warm_pool_acquires_executes_replaces_and_drains() {
     let Some((provider, backend, default_workdir)) = backend_from_environment() else {
         return;
     };
-    let pool = Arc::new(pool(
+    let running = RunningPool::start(pool(
         backend,
         default_workdir,
         Arc::new(EmptySandboxPoolProvisioner),
     ));
-    let (shutdown, receiver) = watch::channel(false);
-    let reconciler = tokio::spawn({
-        let pool = Arc::clone(&pool);
-        async move { pool.run_reconciler(receiver).await }
-    });
+    let pool = &running.pool;
 
-    let (first_lease, first) = acquire(&pool, "worker-one").await;
-    let (second_lease, second) = acquire(&pool, "worker-two").await;
+    let (first_lease, first) = acquire(pool, "worker-one").await;
+    let (second_lease, second) = acquire(pool, "worker-two").await;
     assert_ne!(
         first.id(),
         second.id(),
@@ -203,17 +222,7 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
     );
     assert_eq!(
         first
-            .exec(&SandboxCommand {
-                argv: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "printf first > /tmp/exo-pool-stale-marker".to_string(),
-                ],
-                env: HashMap::new(),
-                display_argv: None,
-                cwd: None,
-                timeout: Some(Duration::from_secs(20)),
-            })
+            .exec(&shell_command("printf first > /tmp/exo-pool-stale-marker",))
             .await
             .unwrap()
             .stdout,
@@ -228,22 +237,13 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
     pool.release(&first_lease).await.unwrap();
     assert!(first.exec(&command("stale")).await.is_err());
 
-    let (reused_lease, reused) = acquire(&pool, "worker-three").await;
+    let (reused_lease, reused) = acquire(pool, "worker-three").await;
     if provider != SandboxProvider::LocalProcess {
         assert_eq!(
             reused
-                .exec(&SandboxCommand {
-                    argv: vec![
-                        "/bin/sh".to_string(),
-                        "-c".to_string(),
-                        "if [ -e /tmp/exo-pool-stale-marker ]; then printf stale; else printf clean; fi"
-                            .to_string(),
-                    ],
-                    env: HashMap::new(),
-                    display_argv: None,
-                    cwd: None,
-                    timeout: Some(Duration::from_secs(20)),
-                })
+                .exec(&shell_command(
+                    "if [ -e /tmp/exo-pool-stale-marker ]; then printf stale; else printf clean; fi",
+                ))
                 .await
                 .unwrap()
                 .stdout,
@@ -257,14 +257,7 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
 
     pool.release(&second_lease).await.unwrap();
     pool.release(&reused_lease).await.unwrap();
-    pool.drain().await.unwrap();
-    assert_eq!(pool.entry_count().await, 0);
-
-    shutdown.send(true).unwrap();
-    time::timeout(Duration::from_secs(10), reconciler)
-        .await
-        .expect("reconciler should stop")
-        .expect("reconciler task should not panic");
+    running.stop().await;
 }
 
 #[tokio::test]
@@ -273,14 +266,10 @@ async fn recipe_seeded_pool_exposes_the_initialized_filesystem() {
     let Some((_provider, backend, default_workdir)) = backend_from_environment() else {
         return;
     };
-    let pool = Arc::new(pool(backend, default_workdir, Arc::new(CommandSeeder)));
-    let (shutdown, receiver) = watch::channel(false);
-    let reconciler = tokio::spawn({
-        let pool = Arc::clone(&pool);
-        async move { pool.run_reconciler(receiver).await }
-    });
+    let running = RunningPool::start(pool(backend, default_workdir, Arc::new(CommandSeeder)));
+    let pool = &running.pool;
 
-    let (lease, sandbox) = acquire(&pool, "recipe-worker").await;
+    let (lease, sandbox) = acquire(pool, "recipe-worker").await;
     assert_eq!(
         sandbox
             .exec(&SandboxCommand {
@@ -300,12 +289,7 @@ async fn recipe_seeded_pool_exposes_the_initialized_filesystem() {
     );
 
     pool.release(&lease).await.unwrap();
-    pool.drain().await.unwrap();
-    shutdown.send(true).unwrap();
-    time::timeout(Duration::from_secs(10), reconciler)
-        .await
-        .expect("reconciler should stop")
-        .expect("reconciler task should not panic");
+    running.stop().await;
 }
 
 #[tokio::test]
@@ -319,18 +303,14 @@ async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
         return;
     }
 
-    let pool = Arc::new(pool(
+    let running = RunningPool::start(pool(
         backend,
         default_workdir,
         Arc::new(EmptySandboxPoolProvisioner),
     ));
-    let (shutdown, receiver) = watch::channel(false);
-    let reconciler = tokio::spawn({
-        let pool = Arc::clone(&pool);
-        async move { pool.run_reconciler(receiver).await }
-    });
+    let pool = &running.pool;
 
-    let (lease, sandbox) = acquire(&pool, "runtime-loss-worker").await;
+    let (lease, sandbox) = acquire(pool, "runtime-loss-worker").await;
     assert_eq!(
         sandbox.exec(&command("before")).await.unwrap().stdout,
         "before"
@@ -355,10 +335,5 @@ async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
     pool.heartbeat(&lease).await.unwrap();
 
     pool.release(&lease).await.unwrap();
-    pool.drain().await.unwrap();
-    shutdown.send(true).unwrap();
-    time::timeout(Duration::from_secs(10), reconciler)
-        .await
-        .expect("reconciler should stop")
-        .expect("reconciler task should not panic");
+    running.stop().await;
 }

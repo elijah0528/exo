@@ -19,14 +19,14 @@ pub trait SecretResolver: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct RecipePolicy {
     pub command_timeout: Duration,
-    pub max_output_bytes: usize,
+    pub max_output_bytes_per_stream: usize,
 }
 
 impl Default for RecipePolicy {
     fn default() -> Self {
         Self {
             command_timeout: Duration::from_secs(300),
-            max_output_bytes: 1024 * 1024,
+            max_output_bytes_per_stream: 1024 * 1024,
         }
     }
 }
@@ -81,7 +81,7 @@ impl RecipeService {
         }
     }
 
-    /// Create a sandbox an run a setup recipe
+    /// Create a sandbox and run its setup recipe.
     ///
     /// Returns an error if the setup script fails
     pub async fn create_sandbox(
@@ -117,10 +117,6 @@ impl RecipeService {
         Ok(sandbox_id)
     }
 
-    /// Runs an individual step of the recipe
-    ///
-    /// 1. GithubRepository clones or checkouts a repository
-    /// 2. Command runds commands on the sandbox
     async fn run_step(&self, sandbox_id: &SandboxId, step: SandboxRecipeStep) -> Result<()> {
         match step {
             SandboxRecipeStep::GithubRepository {
@@ -213,7 +209,7 @@ impl RecipeService {
             .await?;
         let parts = process.into_parts();
         let (stdout, stderr) = (parts.stdout, parts.stderr);
-        let max_output_bytes = self.policy.max_output_bytes;
+        let max_output_bytes = self.policy.max_output_bytes_per_stream;
         let command_result = time::timeout(self.policy.command_timeout, async move {
             tokio::try_join!(
                 read_output(stdout, max_output_bytes, "stdout"),
@@ -223,8 +219,7 @@ impl RecipeService {
         })
         .await
         .map_err(|_| anyhow::anyhow!("recipe command timed out"))?;
-        let (stdout, stderr, exit_code) = command_result?;
-        drop(stdout);
+        let (_stdout, stderr, exit_code) = command_result?;
         if exit_code != 0 {
             bail!(
                 "recipe command failed: {}",

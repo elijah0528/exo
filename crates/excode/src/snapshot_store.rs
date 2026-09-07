@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,8 +54,9 @@ pub trait SandboxPoolSnapshotStore: Send + Sync {
 
 /// A single-process, filesystem-backed snapshot cache.
 ///
-/// Snapshots are scoped by pool and owner. Pruning removes least-recently-used
-/// snapshots until every configured retention limit is satisfied.
+/// Snapshot identities are scoped by pool and owner. Retention limits apply
+/// across the whole store, and pruning removes least-recently-used snapshots
+/// until every limit is satisfied.
 #[derive(Debug, Clone)]
 pub struct LocalSandboxPoolStore {
     root: PathBuf,
@@ -69,14 +69,12 @@ struct SnapshotManifest {
     snapshot_id: SnapshotId,
     format: SnapshotFormat,
     size_bytes: u64,
-    #[serde(default)]
     content_hash: String,
     last_accessed_at_ms: u64,
 }
 
 struct SnapshotRecord {
     directory: PathBuf,
-    scope: PathBuf,
     manifest: SnapshotManifest,
 }
 
@@ -125,7 +123,6 @@ impl LocalSandboxPoolStore {
                 for directory in directories(&owner).await? {
                     records.push(SnapshotRecord {
                         manifest: read_manifest(&directory.join("manifest.json")).await?,
-                        scope: owner.clone(),
                         directory,
                     });
                 }
@@ -169,11 +166,6 @@ impl SandboxPoolSnapshotStore for LocalSandboxPoolStore {
         if fs::try_exists(&owner_directory).await? {
             for directory in directories(&owner_directory).await? {
                 let mut manifest = read_manifest(&directory.join("manifest.json")).await?;
-                if manifest.content_hash.is_empty() {
-                    let bytes = fs::read(directory.join("payload.bin")).await?;
-                    manifest.content_hash = content_hash(&manifest.format, &bytes)?;
-                    write_manifest(&directory.join("manifest.json"), &manifest).await?;
-                }
                 if manifest.content_hash == payload_hash {
                     manifest.last_accessed_at_ms = now_ms();
                     write_manifest(&directory.join("manifest.json"), &manifest).await?;
@@ -232,7 +224,7 @@ impl SandboxPoolSnapshotStore for LocalSandboxPoolStore {
             bail!("snapshot payload size does not match its manifest");
         }
         let actual_hash = content_hash(&manifest.format, &bytes)?;
-        if !manifest.content_hash.is_empty() && manifest.content_hash != actual_hash {
+        if manifest.content_hash != actual_hash {
             bail!("snapshot payload hash does not match its manifest");
         }
         manifest.last_accessed_at_ms = now_ms();
@@ -278,34 +270,13 @@ impl SandboxPoolSnapshotStore for LocalSandboxPoolStore {
         self.remove_temporary_directories().await?;
         let now = now_ms();
         let mut records = self.records().await?;
-        for record in &mut records {
-            if record.manifest.content_hash.is_empty() {
-                let bytes = fs::read(record.directory.join("payload.bin")).await?;
-                record.manifest.content_hash = content_hash(&record.manifest.format, &bytes)?;
-                write_manifest(&record.directory.join("manifest.json"), &record.manifest).await?;
-            }
-        }
-        records.sort_by_key(|record| std::cmp::Reverse(record.manifest.last_accessed_at_ms));
-
         let mut remaining_count = records.len();
         let mut remaining_bytes = records
             .iter()
             .map(|record| record.manifest.size_bytes)
             .sum::<u64>();
-        let mut seen_hashes = HashSet::new();
-        let mut unique_records = Vec::with_capacity(records.len());
+        records.sort_by_key(|record| record.manifest.last_accessed_at_ms);
         for record in records {
-            let deduplication_key = (record.scope.clone(), record.manifest.content_hash.clone());
-            if !seen_hashes.insert(deduplication_key) {
-                fs::remove_dir_all(record.directory).await?;
-                remaining_count -= 1;
-                remaining_bytes = remaining_bytes.saturating_sub(record.manifest.size_bytes);
-            } else {
-                unique_records.push(record);
-            }
-        }
-        unique_records.sort_by_key(|record| record.manifest.last_accessed_at_ms);
-        for record in unique_records {
             let expired = self.retention.idle_ttl.is_some_and(|ttl| {
                 now.saturating_sub(record.manifest.last_accessed_at_ms) >= ttl.as_millis() as u64
             });

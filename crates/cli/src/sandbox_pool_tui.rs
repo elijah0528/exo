@@ -95,8 +95,7 @@ pub async fn run(root: &Path, args: SandboxPoolArgs) -> Result<()> {
         },
         backend,
         PoolCapacity {
-            min_ready: args.workers,
-            target_ready: args.workers,
+            warm_size: args.workers,
             max_total: max_workers,
             lease_ttl: Duration::from_secs(300),
             idle_ttl: Duration::from_secs(600),
@@ -469,11 +468,7 @@ impl PoolTui {
             cwd: None,
             timeout: Some(Duration::from_secs(300)),
         };
-        let result = if is_read_only_command(&command) {
-            active.sandbox.exec_read_only(&sandbox_command).await?
-        } else {
-            active.sandbox.exec(&sandbox_command).await?
-        };
+        let result = active.sandbox.exec(&sandbox_command).await?;
         self.terminal_line(format!("$ {command}"));
         if !result.stdout.trim().is_empty() {
             self.terminal_text(result.stdout.trim_end());
@@ -484,10 +479,8 @@ impl PoolTui {
         if !result.ok {
             self.terminal_line(format!("command failed with {:?}", result.exit_code));
         }
-        if !is_read_only_command(&command) {
-            self.dirty = true;
-            self.terminal_line("sandbox filesystem marked dirty");
-        }
+        self.dirty = true;
+        self.terminal_line("sandbox filesystem marked dirty");
         self.terminal_scroll = 0;
         self.refresh().await?;
         Ok(())
@@ -875,22 +868,6 @@ fn format_terminal_line(line: &str) -> String {
         return format!("[pool] {line}");
     }
     line.to_string()
-}
-
-fn is_read_only_command(command: &str) -> bool {
-    let command = command.trim();
-    matches!(command, "ls" | "pwd" | "whoami" | "env" | "printenv")
-        || command.starts_with("ls ")
-        || command.starts_with("cat ")
-        || command.starts_with("head ")
-        || command.starts_with("tail ")
-        || command.starts_with("find ")
-        || command.starts_with("stat ")
-        || command.starts_with("test ")
-        || command.starts_with("git status")
-        || command.starts_with("git diff")
-        || command.starts_with("git log")
-        || command.starts_with("git rev-parse")
 }
 
 fn format_bytes(bytes: u64) -> String {

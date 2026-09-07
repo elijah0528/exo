@@ -18,7 +18,7 @@ shlex.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 url.workspace = true
-tempfile.workspace = true
 base64 = "0.22.1"
 
 [dev-dependencies]
+tempfile.workspace = true
