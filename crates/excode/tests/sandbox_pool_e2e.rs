@@ -85,6 +85,7 @@ fn pool(
             idle_ttl: Duration::from_secs(120),
         },
         recipe,
+        None,
     )
     .expect("valid pool capacity")
 }
@@ -178,7 +179,7 @@ async fn acquire(
 #[tokio::test]
 #[ignore = "spawns real local-process or Docker sandboxes; CI runs ignored integration tests"]
 async fn warm_pool_acquires_executes_replaces_and_drains() {
-    let Some((_provider, backend, default_workdir)) = backend_from_environment() else {
+    let Some((provider, backend, default_workdir)) = backend_from_environment() else {
         return;
     };
     let pool = Arc::new(pool(
@@ -199,23 +200,55 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
         second.id(),
         "the warm pool should provide distinct runtimes"
     );
-    assert_eq!(first.exec(&command("first")).await.unwrap().stdout, "first");
+    assert_eq!(
+        first
+            .exec(&SandboxCommand {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf first > /tmp/exo-pool-stale-marker".to_string(),
+                ],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: None,
+                timeout: Some(Duration::from_secs(20)),
+            })
+            .await
+            .unwrap()
+            .stdout,
+        ""
+    );
     assert_eq!(
         second.exec(&command("second")).await.unwrap().stdout,
         "second"
     );
     pool.heartbeat(&first_lease).await.unwrap();
 
-    let released_id = first.id().to_string();
     pool.release(&first_lease).await.unwrap();
     assert!(first.exec(&command("stale")).await.is_err());
 
     let (reused_lease, reused) = acquire(&pool, "worker-three").await;
-    assert_eq!(
-        reused.id(),
-        released_id,
-        "released runtime should remain warm"
-    );
+    if provider != SandboxProvider::LocalProcess {
+        assert_eq!(
+            reused
+                .exec(&SandboxCommand {
+                    argv: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "if [ -e /tmp/exo-pool-stale-marker ]; then printf stale; else printf clean; fi"
+                            .to_string(),
+                    ],
+                    env: HashMap::new(),
+                    display_argv: None,
+                    cwd: None,
+                    timeout: Some(Duration::from_secs(20)),
+                })
+                .await
+                .unwrap()
+                .stdout,
+            "clean"
+        );
+    }
     assert_eq!(
         reused.exec(&command("reused")).await.unwrap().stdout,
         "reused"

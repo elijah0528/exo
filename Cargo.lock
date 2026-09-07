@@ -2531,6 +2531,8 @@ dependencies = [
  "bytes",
  "exoharness",
  "futures",
+ "serde",
+ "serde_json",
  "shlex",
  "tempfile",
  "tokio",

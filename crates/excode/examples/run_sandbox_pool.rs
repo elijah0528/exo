@@ -139,6 +139,7 @@ async fn main() -> Result<()> {
             idle_ttl: Duration::from_secs(30),
         },
         Arc::new(ExoRepositoryProvisioner),
+        None,
     )?);
 
     // Surface authentication/provider errors before workers wait for capacity.
