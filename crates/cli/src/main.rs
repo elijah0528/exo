@@ -1206,11 +1206,12 @@ async fn main() -> Result<()> {
         #[cfg(not(feature = "firecracker"))]
         bail!("Firecracker bridge support requires building Exo with --features firecracker");
     }
+    let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
+    let env_vars = env.clone().into_vars();
     if let Commands::SandboxPool { args } = &cli.command {
-        return sandbox_pool_tui::run(&cli.root, args.clone()).await;
+        return sandbox_pool_tui::run(&cli.root, args.clone(), env_vars).await;
     }
     let exo_config = build_exo_config(&cli)?;
-    let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
     let runtime_config = env.braintrust_runtime_config(
         cli.braintrust_api_key,
         cli.braintrust_app_url,

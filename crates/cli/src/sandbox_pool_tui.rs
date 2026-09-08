@@ -1,21 +1,28 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
-use excode::{
-    EmptySandboxPoolProvisioner, LocalSandboxPool, LocalSandboxPoolStore, ManagedSandboxLease,
-    PoolCapacity, PoolEntryState, SandboxPoolKey, SandboxPoolSnapshotStore,
-    SandboxPoolSnapshotView, SnapshotRetentionPolicy,
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
 };
+use excode::{
+    CodingAgent, CodingAgentConfig, CodingAgentEvent, CodingResult, EmptySandboxPoolProvisioner,
+    LocalSandboxPool, LocalSandboxPoolStore, ManagedSandboxLease, PoolCapacity, PoolEntryState,
+    SandboxPoolKey, SandboxPoolSnapshotStore, SandboxPoolSnapshotView, SnapshotRetentionPolicy,
+};
+use executor::RouterModelClient;
 use exoharness::{
     CliContainerSandboxBackend, LocalProcessSandboxBackend, ManagedSandboxBackend, SandboxCommand,
     SandboxNetworkPolicy, SandboxSpec, default_docker_image,
 };
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_stream::StreamExt;
+
+type ChatTask = tokio::task::JoinHandle<Result<CodingResult>>;
 
 #[derive(Debug, Clone, Args)]
 pub struct SandboxPoolArgs {
@@ -28,6 +35,9 @@ pub struct SandboxPoolArgs {
     /// Maximum total entries, including leased entries. Defaults to --workers.
     #[arg(long)]
     max_workers: Option<usize>,
+    /// Model used by the interactive coding agent.
+    #[arg(long, default_value = "gpt-4o-mini")]
+    model: String,
     /// Container image used by the Docker backend.
     #[arg(long, default_value_t = default_docker_image())]
     image: String,
@@ -39,7 +49,11 @@ enum PoolBackend {
     Docker,
 }
 
-pub async fn run(root: &Path, args: SandboxPoolArgs) -> Result<()> {
+pub async fn run(
+    root: &Path,
+    args: SandboxPoolArgs,
+    env_vars: HashMap<String, String>,
+) -> Result<()> {
     if args.workers == 0 {
         bail!("--workers must be positive");
     }
@@ -113,9 +127,21 @@ pub async fn run(root: &Path, args: SandboxPoolArgs) -> Result<()> {
         async move { pool.run_reconciler(receiver).await }
     });
 
-    let result = PoolTui::new(pool.clone(), snapshot_store, pool_id.to_string())
-        .run()
-        .await;
+    let result = PoolTui::new(
+        pool.clone(),
+        snapshot_store,
+        pool_id.to_string(),
+        CodingAgent::new(
+            Arc::new(RouterModelClient::new(env_vars)),
+            pool.clone(),
+            CodingAgentConfig {
+                model: args.model,
+                ..Default::default()
+            },
+        ),
+    )
+    .run()
+    .await;
     let _ = shutdown.send(true);
     reconciler
         .await
@@ -127,7 +153,6 @@ pub async fn run(root: &Path, args: SandboxPoolArgs) -> Result<()> {
 struct PoolTui {
     pool: Arc<LocalSandboxPool>,
     entries: Vec<excode::SandboxPoolEntryView>,
-    selected: usize,
     active: Option<ManagedSandboxLease>,
     detached: HashMap<String, ManagedSandboxLease>,
     input: String,
@@ -139,9 +164,12 @@ struct PoolTui {
     pool_id: String,
     snapshots: Vec<SandboxPoolSnapshotView>,
     snapshot_selected: usize,
-    snapshot_focus: bool,
-    terminal_focus: bool,
     dirty: bool,
+    agent: CodingAgent<RouterModelClient>,
+    chat_task: Option<ChatTask>,
+    thinking_since: Option<Instant>,
+    chat_events: Option<UnboundedReceiver<CodingAgentEvent>>,
+    streaming_text: String,
 }
 
 impl PoolTui {
@@ -149,17 +177,17 @@ impl PoolTui {
         pool: Arc<LocalSandboxPool>,
         snapshot_store: Option<Arc<dyn SandboxPoolSnapshotStore>>,
         pool_id: String,
+        agent: CodingAgent<RouterModelClient>,
     ) -> Self {
         let mut terminal = VecDeque::from(["Pool starting...".to_string()]);
         terminal.push_back(if snapshot_store.is_some() {
             "snapshot store: configured (Docker snapshots)".to_string()
         } else {
-            "snapshot store: unavailable for local-process sandboxes".to_string()
+            "snapshot store: unavailable; recipe baseline is in-memory".to_string()
         });
         Self {
             pool,
             entries: Vec::new(),
-            selected: 0,
             active: None,
             detached: HashMap::new(),
             input: String::new(),
@@ -171,15 +199,19 @@ impl PoolTui {
             pool_id,
             snapshots: Vec::new(),
             snapshot_selected: 0,
-            snapshot_focus: false,
-            terminal_focus: false,
             dirty: false,
+            agent,
+            chat_task: None,
+            thinking_since: None,
+            chat_events: None,
+            streaming_text: String::new(),
         }
     }
 
     async fn run(mut self) -> Result<()> {
         self.refresh().await?;
         let mut terminal = ratatui::init();
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
         let mut events = EventStream::new();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
         let mut refresh = tokio::time::interval(Duration::from_secs(1));
@@ -187,13 +219,34 @@ impl PoolTui {
             loop {
                 terminal.draw(|frame| self.draw(frame))?;
                 tokio::select! {
+                    chat = Self::wait_for_chat(&mut self.chat_task) => {
+                        self.drain_chat_events();
+                        self.finish_chat(chat)?;
+                    }
+                    event = Self::wait_for_chat_event(&mut self.chat_events) => {
+                        if let Some(event) = event {
+                            self.handle_chat_event(event);
+                        }
+                    }
                     event = events.next() => {
                         let Some(event) = event else { break Ok(()); };
-                        if let Event::Key(key) = event?
-                            && key.kind == KeyEventKind::Press
-                            && self.handle_key(key).await?
-                        {
-                            break Ok(());
+                        match event? {
+                            Event::Key(key)
+                                if key.kind == KeyEventKind::Press
+                                    && self.handle_key(key).await? =>
+                            {
+                                break Ok(());
+                            }
+                            Event::Mouse(mouse) => match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    self.terminal_scroll = self.terminal_scroll.saturating_add(3);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    self.terminal_scroll = self.terminal_scroll.saturating_sub(3);
+                                }
+                                _ => {}
+                            },
+                            _ => {}
                         }
                     }
                     _ = heartbeat.tick() => self.heartbeat_claims().await?,
@@ -202,11 +255,45 @@ impl PoolTui {
             }
         }
         .await;
+        crossterm::execute!(std::io::stdout(), DisableMouseCapture)?;
         ratatui::restore();
         result
     }
 
+    async fn wait_for_chat(
+        task: &mut Option<ChatTask>,
+    ) -> Option<std::result::Result<Result<CodingResult>, tokio::task::JoinError>> {
+        let Some(task) = task.take() else {
+            return std::future::pending().await;
+        };
+        Some(task.await)
+    }
+
+    async fn wait_for_chat_event(
+        receiver: &mut Option<UnboundedReceiver<CodingAgentEvent>>,
+    ) -> Option<CodingAgentEvent> {
+        let Some(mut current) = receiver.take() else {
+            return std::future::pending().await;
+        };
+        match current.recv().await {
+            Some(event) => {
+                *receiver = Some(current);
+                Some(event)
+            }
+            None => std::future::pending().await,
+        }
+    }
+
     async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(task) = self.chat_task.take() {
+                task.abort();
+                self.thinking_since = None;
+                self.note("agent request cancelled");
+                return Ok(false);
+            }
+            return Ok(true);
+        }
         if self.command_mode {
             match key.code {
                 KeyCode::Esc => self.command_mode = false,
@@ -226,43 +313,18 @@ impl PoolTui {
             return Ok(false);
         }
 
-        if self.terminal_focus {
-            match key.code {
-                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.input.push(ch);
-                    self.command_mode = true;
-                }
-                _ => {}
-            }
-            if self.command_mode {
-                return Ok(false);
-            }
+        if let KeyCode::Char(ch) = key.code
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.input.push(ch);
+            self.command_mode = true;
+            return Ok(false);
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            KeyCode::Char('r') => self.refresh().await?,
-            KeyCode::Down | KeyCode::Char('j') => self.select(1),
-            KeyCode::Up | KeyCode::Char('k') => self.select_up(),
-            KeyCode::Enter if self.snapshot_focus => self.restore_snapshot().await?,
-            KeyCode::Enter => self.acquire_selected().await?,
-            KeyCode::Char('s') => self.restore_snapshot().await?,
-            KeyCode::Char('e') => {
-                if self.active.is_some() {
-                    self.input.clear();
-                    self.command_mode = true;
-                } else {
-                    self.note("Acquire an entry before running a command");
-                }
-            }
-            KeyCode::Char('/') => {
-                self.input.clear();
-                self.input.push('/');
-                self.command_mode = true;
-            }
-            KeyCode::Char('x') => self.release().await?,
-            KeyCode::Char('R') => self.reset().await?,
-            KeyCode::Tab => self.focus_next(),
+            KeyCode::Esc => return Ok(true),
+            KeyCode::Enter => self.acquire_any().await?,
+            KeyCode::Tab => {}
             KeyCode::PageUp => self.terminal_scroll = self.terminal_scroll.saturating_add(5),
             KeyCode::PageDown => self.terminal_scroll = self.terminal_scroll.saturating_sub(5),
             KeyCode::Home => self.terminal_scroll = usize::MAX,
@@ -270,18 +332,6 @@ impl PoolTui {
             _ => {}
         }
         Ok(false)
-    }
-
-    fn focus_next(&mut self) {
-        if self.terminal_focus {
-            self.terminal_focus = false;
-            self.snapshot_focus = true;
-        } else if self.snapshot_focus {
-            self.snapshot_focus = false;
-            self.terminal_focus = false;
-        } else {
-            self.terminal_focus = true;
-        }
     }
 
     async fn handle_input(&mut self, input: String) -> Result<()> {
@@ -303,12 +353,16 @@ impl PoolTui {
                 Ok(())
             }
             "release" => self.release().await,
-            "retire" => self.retire_selected().await,
             "dirty" => self.execute("touch temp.txt".to_string()).await,
-            command if command == "restore" => self.restore_snapshot().await,
+            "restore" => self.restore_snapshot().await,
             command if command.starts_with("restore ") => {
                 self.restore_snapshot_argument(command, "restore").await
             }
+            "chat" => {
+                self.note("Usage: /chat <message>");
+                Ok(())
+            }
+            command if command.starts_with("chat ") => self.start_chat(&command[5..]),
             "" => Ok(()),
             other => {
                 self.note(format!("unknown command: /{other}"));
@@ -317,35 +371,8 @@ impl PoolTui {
         }
     }
 
-    fn select(&mut self, delta: usize) {
-        if self.snapshot_focus {
-            if !self.snapshots.is_empty() {
-                self.snapshot_selected = (self.snapshot_selected + delta) % self.snapshots.len();
-            }
-        } else if !self.entries.is_empty() {
-            self.selected = (self.selected + delta) % self.entries.len();
-        }
-    }
-
-    fn select_up(&mut self) {
-        if self.snapshot_focus {
-            if !self.snapshots.is_empty() {
-                self.snapshot_selected = self
-                    .snapshot_selected
-                    .checked_sub(1)
-                    .unwrap_or(self.snapshots.len() - 1);
-            }
-        } else if !self.entries.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.entries.len() - 1);
-        }
-    }
-
     async fn refresh(&mut self) -> Result<()> {
         self.entries = self.pool.entries().await;
-        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
         if let Some(store) = &self.snapshot_store {
             let baseline_owner = self.pool.baseline_owner_id();
             self.snapshots = store.list(&self.pool_id, &baseline_owner).await?;
@@ -356,32 +383,21 @@ impl PoolTui {
             self.snapshot_selected = self
                 .snapshot_selected
                 .min(self.snapshots.len().saturating_sub(1));
+        } else {
+            self.snapshot_selected = 0;
         }
         Ok(())
     }
 
-    async fn acquire_selected(&mut self) -> Result<()> {
-        let Some(entry) = self.entries.get(self.selected) else {
-            self.note("The pool has no entries yet");
-            return Ok(());
-        };
-        let entry_id = entry.entry_id.clone();
-        let entry_dirty = entry.dirty;
+    async fn acquire_any(&mut self) -> Result<()> {
         if self.active.is_some() {
             self.note("Detach the active sandbox before acquiring another");
             return Ok(());
         }
-        if let Some(lease) = self.detached.remove(&entry_id) {
-            self.note(format!("Attached to claimed {}", lease.sandbox.id()));
-            self.active = Some(lease);
-            self.dirty = entry_dirty;
-            self.refresh().await?;
-            return Ok(());
-        }
-        match self.pool.acquire_entry(&entry_id, "cli").await {
+        match self.pool.acquire_any("cli".to_string()).await {
             Ok(lease) => {
                 self.note(format!("Connected to {}", lease.sandbox.id()));
-                self.dirty = entry_dirty;
+                self.dirty = false;
                 self.active = Some(lease);
             }
             Err(error) => self.note(format!("Acquire failed: {error:#}")),
@@ -399,32 +415,6 @@ impl PoolTui {
         self.detached.insert(entry_id, lease);
         self.dirty = false;
         self.note("Detached; lease remains claimed and heartbeated");
-    }
-
-    async fn retire_selected(&mut self) -> Result<()> {
-        let Some(entry) = self.entries.get(self.selected) else {
-            self.note("The pool has no entries yet");
-            return Ok(());
-        };
-        let entry_id = entry.entry_id.clone();
-        let lease = if self
-            .active
-            .as_ref()
-            .is_some_and(|lease| lease.lease.entry_id == entry_id)
-        {
-            self.active.take()
-        } else {
-            self.detached.remove(&entry_id)
-        };
-        let Some(lease) = lease else {
-            self.note("Claim the selected sandbox before retiring it");
-            return Ok(());
-        };
-        self.pool.reset(&lease.lease).await?;
-        self.dirty = false;
-        self.note(format!("Retired {}", lease.sandbox.id()));
-        self.refresh().await?;
-        Ok(())
     }
 
     async fn heartbeat_claims(&mut self) -> Result<()> {
@@ -486,6 +476,101 @@ impl PoolTui {
         Ok(())
     }
 
+    fn start_chat(&mut self, prompt: &str) -> Result<()> {
+        let prompt = prompt
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if prompt.is_empty() {
+            self.note("Usage: /chat <message>");
+            return Ok(());
+        }
+        let Some(active) = self.active.as_ref() else {
+            self.note("Attach a sandbox before chatting with the agent");
+            return Ok(());
+        };
+        if self.chat_task.is_some() {
+            self.note("an agent request is already running");
+            return Ok(());
+        }
+        let agent = self.agent.clone();
+        let lease = active.lease.clone();
+        let sandbox = Arc::clone(&active.sandbox);
+        let (events, receiver) = mpsc::unbounded_channel();
+        self.terminal_line(format!("user: {prompt}"));
+        self.thinking_since = Some(Instant::now());
+        self.chat_events = Some(receiver);
+        self.streaming_text.clear();
+        self.chat_task = Some(tokio::spawn(async move {
+            agent
+                .run_on_lease_streaming(&lease, sandbox.as_ref(), &prompt, events)
+                .await
+        }));
+        Ok(())
+    }
+
+    fn handle_chat_event(&mut self, event: CodingAgentEvent) {
+        match event {
+            CodingAgentEvent::TextChunk(text) => self.streaming_text.push_str(&text),
+            CodingAgentEvent::ToolCall { name } => {
+                self.flush_streaming_text();
+                self.terminal_line(format!("[tool] {name}"));
+                self.terminal_line("[fs] sandbox filesystem marked dirty");
+                self.dirty = true;
+            }
+            CodingAgentEvent::ToolResult { name, output } => {
+                self.terminal_text(&format!("[tool result: {name}] {output}"));
+            }
+        }
+    }
+
+    fn flush_streaming_text(&mut self) {
+        let text = std::mem::take(&mut self.streaming_text);
+        if !text.trim().is_empty() {
+            self.terminal_text(&format!("agent: {}", text.trim_end()));
+        }
+    }
+
+    fn drain_chat_events(&mut self) {
+        while let Some(receiver) = self.chat_events.as_mut() {
+            match receiver.try_recv() {
+                Ok(event) => self.handle_chat_event(event),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.chat_events = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn finish_chat(
+        &mut self,
+        result: Option<std::result::Result<Result<CodingResult>, tokio::task::JoinError>>,
+    ) -> Result<()> {
+        let Some(result) = result else {
+            return Ok(());
+        };
+        self.thinking_since = None;
+        self.chat_events = None;
+        match result {
+            Ok(Ok(result)) => {
+                let had_streamed_text = !self.streaming_text.trim().is_empty();
+                self.flush_streaming_text();
+                if !had_streamed_text && !result.response.trim().is_empty() {
+                    self.terminal_text(&format!("agent: {}", result.response.trim_end()));
+                }
+                self.dirty |= !result.tools.is_empty();
+                self.note(format!("agent completed in {} round(s)", result.rounds));
+            }
+            Ok(Err(error)) => self.note(format!("agent failed: {error:#}")),
+            Err(error) => self.note(format!("agent task failed: {error}")),
+        }
+        self.terminal_scroll = 0;
+        Ok(())
+    }
+
     async fn release(&mut self) -> Result<()> {
         let Some(active) = self.active.take() else {
             return Ok(());
@@ -518,6 +603,28 @@ impl PoolTui {
     }
 
     async fn restore_snapshot_number(&mut self, number: usize) -> Result<()> {
+        if self.snapshot_store.is_none() {
+            if number != 1 {
+                self.note("The in-memory recipe baseline is snapshot 1");
+                return Ok(());
+            }
+            if self.active.is_some() {
+                self.note("Release the active sandbox before restoring a snapshot");
+                return Ok(());
+            }
+            self.terminal_line("restoring recipe baseline 1...");
+            match self.pool.acquire_any("cli".to_string()).await {
+                Ok(lease) => {
+                    self.dirty = false;
+                    self.active = Some(lease);
+                    self.note("restored recipe baseline 1");
+                    self.terminal_line("recipe baseline restored; sandbox is connected");
+                }
+                Err(error) => self.terminal_line(format!("baseline restore failed: {error:#}")),
+            }
+            self.refresh().await?;
+            return Ok(());
+        }
         if number == 0 || number > self.snapshots.len() {
             self.note(format!(
                 "Snapshot {number} does not exist; choose 1-{}",
@@ -566,17 +673,6 @@ impl PoolTui {
         self.restore_snapshot_number(number).await
     }
 
-    async fn reset(&mut self) -> Result<()> {
-        let Some(active) = self.active.take() else {
-            self.note("No sandbox is connected");
-            return Ok(());
-        };
-        self.pool.reset(&active.lease).await?;
-        self.note("Sandbox reset and removed from the pool");
-        self.refresh().await?;
-        Ok(())
-    }
-
     fn note(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.log.push_back(message.clone());
@@ -603,15 +699,11 @@ impl PoolTui {
         use ratatui::layout::{Alignment, Constraint, Direction, Layout};
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
-        use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState, Wrap};
+        use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
 
         let areas = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(7),
-                Constraint::Min(12),
-            ])
+            .constraints([Constraint::Length(3), Constraint::Min(12)])
             .split(frame.area());
         let title = Paragraph::new(Line::from(vec![
             Span::styled(
@@ -621,16 +713,20 @@ impl PoolTui {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(
-                "  Enter attach  /attach /detach /release /retire /dirty  s restore  x release  Tab focus  q quit",
+                "  Enter acquire any  /chat <message>  /detach  /release  /dirty  /restore <#>  wheel/PgUp/PgDn scroll  Ctrl-C quit",
             ),
         ]))
         .block(Block::default().borders(Borders::ALL).title("Pool"));
         frame.render_widget(title, areas[0]);
 
-        let selectors = Layout::default()
+        let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .constraints([Constraint::Percentage(78), Constraint::Percentage(22)])
             .split(areas[1]);
+        let sidebar = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(body[1]);
 
         let ready_count = self
             .entries
@@ -639,7 +735,7 @@ impl PoolTui {
             .count();
         let capacity = self.pool.capacity();
         let sandbox_title = format!(
-            "Sandboxes [Tab]  Warm Sandboxes available {ready_count}  Total sandboxes {}  Max sandboxes {}",
+            "Sandboxes  Ready {ready_count}  Total {}  Max {}",
             self.entries.len(),
             capacity.max_total,
         );
@@ -694,29 +790,34 @@ impl PoolTui {
             Block::default()
                 .borders(Borders::ALL)
                 .title(sandbox_title)
-                .border_style(if self.snapshot_focus {
-                    Style::default()
-                } else {
-                    Style::default().fg(Color::Cyan)
-                }),
+                .border_style(Style::default()),
         );
-        let mut state = TableState::default();
-        state.select((!self.entries.is_empty()).then_some(self.selected));
-        frame.render_stateful_widget(table, selectors[0], &mut state);
+        frame.render_widget(table, sidebar[0]);
 
-        let snapshot_rows = self.snapshots.iter().enumerate().map(|(index, snapshot)| {
-            Row::new(vec![
-                format!("{}", index + 1),
-                short_id(&snapshot.snapshot_id.to_string()),
-                format_bytes(snapshot.size_bytes),
-                if snapshot.owner_id.starts_with(excode::RECIPE_BASELINE_OWNER) {
-                    "baseline".to_string()
-                } else {
-                    "checkpoint".to_string()
-                },
-            ])
-            .style(Style::default().fg(Color::Magenta))
-        });
+        let snapshot_rows = if self.snapshot_store.is_none() {
+            vec![
+                Row::new(["1", "recipe baseline", "-", "in-memory"])
+                    .style(Style::default().fg(Color::Magenta)),
+            ]
+        } else {
+            self.snapshots
+                .iter()
+                .enumerate()
+                .map(|(index, snapshot)| {
+                    Row::new(vec![
+                        format!("{}", index + 1),
+                        short_id(&snapshot.snapshot_id.to_string()),
+                        format_bytes(snapshot.size_bytes),
+                        if snapshot.owner_id.starts_with(excode::RECIPE_BASELINE_OWNER) {
+                            "baseline".to_string()
+                        } else {
+                            "checkpoint".to_string()
+                        },
+                    ])
+                    .style(Style::default().fg(Color::Magenta))
+                })
+                .collect::<Vec<_>>()
+        };
         let snapshot_table = Table::new(
             snapshot_rows,
             [
@@ -737,16 +838,10 @@ impl PoolTui {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Snapshot Store [Tab]")
-                .border_style(if self.snapshot_focus {
-                    Style::default().fg(Color::Magenta)
-                } else {
-                    Style::default()
-                }),
+                .title("Snapshot Store (read-only)")
+                .border_style(Style::default()),
         );
-        let mut snapshot_state = TableState::default();
-        snapshot_state.select((!self.snapshots.is_empty()).then_some(self.snapshot_selected));
-        frame.render_stateful_widget(snapshot_table, selectors[1], &mut snapshot_state);
+        frame.render_widget(snapshot_table, sidebar[1]);
 
         let mut lines = self
             .terminal
@@ -766,10 +861,19 @@ impl PoolTui {
         } else if let Some(active) = &self.active {
             lines.push(Line::from(format!("connected: {}", active.sandbox.id())));
         }
-        let visible_lines = usize::from(areas[2].height.saturating_sub(2));
+        let visible_lines = usize::from(body[0].height.saturating_sub(2));
         let max_scroll = lines.len().saturating_sub(visible_lines);
         let scroll = max_scroll.saturating_sub(self.terminal_scroll.min(max_scroll));
-        let terminal_title = if self.dirty {
+        let terminal_title = if let Some(started) = self.thinking_since {
+            Line::from(vec![
+                Span::raw("Terminal  "),
+                Span::styled("thinking ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{}s", started.elapsed().as_secs()),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ])
+        } else if self.dirty {
             Line::from(vec![
                 Span::raw("Terminal  "),
                 Span::styled("●", Style::default().fg(Color::Yellow)),
@@ -786,13 +890,9 @@ impl PoolTui {
                         .borders(Borders::ALL)
                         .title(terminal_title)
                         .title_alignment(Alignment::Right)
-                        .border_style(if self.terminal_focus {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default()
-                        }),
+                        .border_style(Style::default().fg(Color::Cyan)),
                 ),
-            areas[2],
+            body[0],
         );
     }
 
