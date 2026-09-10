@@ -1,0 +1,38 @@
+//! CLI surface for the excode terminal.
+
+use clap::{Args, ValueEnum};
+use exoharness::default_docker_image;
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum PoolBackend {
+    LocalProcess,
+    Docker,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ExcodeArgs {
+    /// Provider used for pool runtimes.
+    #[arg(long, value_enum, default_value_t = PoolBackend::LocalProcess)]
+    pub backend: PoolBackend,
+    /// Number of warm entries to maintain.
+    #[arg(long, default_value_t = 2)]
+    pub workers: usize,
+    /// Maximum total entries, including leased entries. Defaults to --workers.
+    #[arg(long)]
+    pub max_workers: Option<usize>,
+    /// Model used by the interactive coding agent.
+    #[arg(long, default_value = "gpt-4o-mini")]
+    pub model: String,
+    /// Container image used by the Docker backend.
+    #[arg(long, default_value_t = default_docker_image())]
+    pub image: String,
+    /// Start with the sandbox utilization panel visible.
+    #[arg(long)]
+    pub debug: bool,
+}
+
+impl ExcodeArgs {
+    pub fn max_total(&self) -> usize {
+        self.max_workers.unwrap_or(self.workers)
+    }
+}

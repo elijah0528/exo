@@ -506,7 +506,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn reset(&self, _lease: &SandboxLease) -> Result<()> {
+        async fn retire(&self, _lease: &SandboxLease) -> Result<()> {
             Ok(())
         }
 

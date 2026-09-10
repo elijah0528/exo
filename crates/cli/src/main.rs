@@ -2,6 +2,7 @@ mod adapters;
 mod env;
 #[cfg(test)]
 mod env_tests;
+mod excode;
 #[cfg(test)]
 mod mount_tests;
 #[cfg(test)]
@@ -590,6 +591,11 @@ enum Commands {
     SandboxPool {
         #[command(flatten)]
         args: sandbox_pool_tui::SandboxPoolArgs,
+    },
+    /// The excode terminal: sandbox pool, coding agent, and diffs.
+    Excode {
+        #[command(flatten)]
+        args: excode::ExcodeArgs,
     },
     /// Manage local stored secrets.
     Secret {
@@ -1211,6 +1217,9 @@ async fn main() -> Result<()> {
     if let Commands::SandboxPool { args } = &cli.command {
         return sandbox_pool_tui::run(&cli.root, args.clone(), env_vars).await;
     }
+    if let Commands::Excode { args } = &cli.command {
+        return excode::run(&cli.root, args.clone(), env_vars).await;
+    }
     let exo_config = build_exo_config(&cli)?;
     let runtime_config = env.braintrust_runtime_config(
         cli.braintrust_api_key,
@@ -1265,6 +1274,9 @@ async fn main() -> Result<()> {
         }
         Commands::SandboxPool { .. } => {
             unreachable!("sandbox pool returns before harness startup")
+        }
+        Commands::Excode { .. } => {
+            unreachable!("excode returns before harness startup")
         }
         Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
@@ -2980,6 +2992,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         Commands::Secret { .. }
         | Commands::FirecrackerBridge
         | Commands::SandboxPool { .. }
+        | Commands::Excode { .. }
         | Commands::Sandbox { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }

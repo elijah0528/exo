@@ -1,0 +1,3 @@
+[alias]
+# `cargo excode` / `cargo excode --debug` start the terminal.
+excode = "run -p exo --bin exo -- excode"
