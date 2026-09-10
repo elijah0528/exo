@@ -35,9 +35,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, watch};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tokio::time::{self, MissedTickBehavior};
 
 use exoharness::{
@@ -86,11 +86,9 @@ pub struct PoolCapacity {
 
 #[derive(Debug, Clone)]
 pub struct PoolPolicy {
-    pub provider_operation_limit: usize,
     pub provider_timeout: Duration,
     pub health_check_command: Vec<String>,
     pub health_check_timeout: Duration,
-    pub health_check_interval: Duration,
     pub reconcile_interval: Duration,
     pub command_timeout: Duration,
 }
@@ -98,11 +96,9 @@ pub struct PoolPolicy {
 impl Default for PoolPolicy {
     fn default() -> Self {
         Self {
-            provider_operation_limit: 8,
             provider_timeout: Duration::from_secs(120),
             health_check_command: vec!["true".to_string()],
             health_check_timeout: Duration::from_secs(5),
-            health_check_interval: Duration::from_secs(30),
             reconcile_interval: Duration::from_secs(10),
             command_timeout: Duration::from_secs(300),
         }
@@ -139,18 +135,12 @@ impl SandboxPoolProvisioner for EmptySandboxPoolProvisioner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolEntryState {
     Creating,
-    Checking,
     Ready,
     Leased,
     /// The filesystem is being checkpointed/reset and must not be leased.
     Resetting,
     /// The entry must not be leased and will be destroyed by reconciliation.
     Retiring,
-}
-
-enum ReconcileTask {
-    HealthCheck(String),
-    Retire(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,16 +172,13 @@ struct PoolEntry {
     last_used_at: Instant,
     dirty: bool,
     snapshot_id: Option<SnapshotId>,
-    last_health_check_at: Option<Instant>,
     lifecycle: Arc<RwLock<()>>,
 }
 
 impl PoolEntry {
-    fn reconciliation_task(
-        &mut self,
-        now: Instant,
-        health_check_interval: Duration,
-    ) -> Option<ReconcileTask> {
+    /// Retire an entry whose lease has expired, and report whether the entry
+    /// is now waiting to be destroyed.
+    fn needs_retirement(&mut self, now: Instant) -> bool {
         if self.state == PoolEntryState::Leased
             && self
                 .lease
@@ -200,17 +187,7 @@ impl PoolEntry {
         {
             self.state = PoolEntryState::Retiring;
         }
-        match self.state {
-            PoolEntryState::Ready
-                if self
-                    .last_health_check_at
-                    .is_none_or(|last| now.duration_since(last) >= health_check_interval) =>
-            {
-                Some(ReconcileTask::HealthCheck(self.id.clone()))
-            }
-            PoolEntryState::Retiring => Some(ReconcileTask::Retire(self.id.clone())),
-            _ => None,
-        }
+        self.state == PoolEntryState::Retiring
     }
 }
 
@@ -220,12 +197,15 @@ pub struct LocalSandboxPool {
     backend: Arc<dyn ManagedSandboxBackend>,
     provisioner: Arc<dyn SandboxPoolProvisioner>,
     snapshot_store: Option<Arc<dyn SandboxPoolSnapshotStore>>,
-    baseline_snapshot: Mutex<Option<SnapshotId>>,
+    /// All sandboxes in a pool share the same baseline snapshot, which is what
+    /// makes their entries interchangeable. It is written once when the first
+    /// entry is created and rewritten only when it turns out to be unusable.
+    baseline_snapshot: RwLock<Option<SnapshotId>>,
     policy: PoolPolicy,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
     capacity: PoolCapacity,
-    notify: Arc<Notify>,
-    provider_operations: Semaphore,
+    /// Woken whenever the entry table changes, both for waiters in
+    /// [`Self::acquire`] and for the reconciler.
     changed: Arc<Notify>,
     reconcile: Mutex<()>,
     closed: AtomicBool,
@@ -255,7 +235,7 @@ pub trait ManagedSandboxPool: Send + Sync {
     async fn acquire_any(&self, worker_id: String) -> Result<ManagedSandboxLease>;
     async fn heartbeat(&self, lease: &SandboxLease) -> Result<()>;
     async fn release(&self, lease: &SandboxLease) -> Result<Option<SnapshotId>>;
-    async fn reset(&self, lease: &SandboxLease) -> Result<()>;
+    async fn retire(&self, lease: &SandboxLease) -> Result<()>;
     async fn drain(&self) -> Result<()>;
 }
 
@@ -277,7 +257,7 @@ impl ManagedSandboxPool for KubernetesSandboxPool {
         bail!("KubernetesSandboxPool is not implemented")
     }
 
-    async fn reset(&self, _lease: &SandboxLease) -> Result<()> {
+    async fn retire(&self, _lease: &SandboxLease) -> Result<()> {
         bail!("KubernetesSandboxPool is not implemented")
     }
 
@@ -302,7 +282,6 @@ impl PoolEntry {
             last_used_at: Instant::now(),
             dirty: false,
             snapshot_id: None,
-            last_health_check_at: None,
             lifecycle: Arc::new(RwLock::new(())),
         }
     }
@@ -334,36 +313,18 @@ impl LocalSandboxPool {
         snapshot_store: Option<Arc<dyn SandboxPoolSnapshotStore>>,
         policy: PoolPolicy,
     ) -> Result<Self> {
-        if key.pool_id.trim().is_empty()
-            || key.recipe_id.trim().is_empty()
-            || capacity.warm_size == 0
-            || capacity.warm_size > capacity.max_total
-            || capacity.lease_ttl.is_zero()
-            || policy.provider_operation_limit == 0
-            || policy.provider_timeout.is_zero()
-            || policy
-                .health_check_command
-                .first()
-                .is_none_or(|command| command.trim().is_empty())
-            || policy.health_check_timeout.is_zero()
-            || policy.health_check_interval.is_zero()
-            || policy.reconcile_interval.is_zero()
-            || policy.command_timeout.is_zero()
-        {
-            bail!("invalid pool capacity or policy");
-        }
-        let provider_operation_limit = policy.provider_operation_limit;
+        validate_key(&key)?;
+        validate_capacity(&capacity)?;
+        validate_policy(&policy)?;
         Ok(Self {
             key,
             backend,
             provisioner,
             snapshot_store,
-            baseline_snapshot: Mutex::new(None),
+            baseline_snapshot: RwLock::new(None),
             policy,
             entries: Arc::new(Mutex::new(HashMap::new())),
             capacity,
-            notify: Arc::new(Notify::new()),
-            provider_operations: Semaphore::new(provider_operation_limit),
             changed: Arc::new(Notify::new()),
             reconcile: Mutex::new(()),
             closed: AtomicBool::new(false),
@@ -408,7 +369,6 @@ impl LocalSandboxPool {
             bail!("sandbox pool entry already exists: {}", entry.id);
         }
         entries.insert(entry.id.clone(), entry);
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(())
     }
@@ -463,11 +423,17 @@ impl LocalSandboxPool {
                 return Err(error);
             }
         };
+        // A warm runtime can die while it waits to be leased, so it is probed
+        // here rather than on a background interval. Retiring it makes the
+        // caller retry against replacement capacity.
+        if let Err(error) = self.health_check(handle.as_ref()).await {
+            tracing::warn!(%error, %entry_id, "retiring sandbox pool entry that failed its health check");
+            self.mark_retiring(&entry_id, &lease).await;
+            return Err(anyhow::Error::new(NoReadyCapacity));
+        }
 
         let mut entries = self.entries.lock().await;
-        let entry = entries
-            .get_mut(&entry_id)
-            .ok_or_else(|| anyhow!("sandbox pool entry disappeared: {entry_id}"))?;
+        let entry = entry_mut(&mut entries, &entry_id)?;
         if validate_lease(entry, &lease).is_err() {
             // A concurrent release/reset invalidated this acquisition. Do not
             // return a handle whose ownership is no longer represented by the
@@ -485,7 +451,6 @@ impl LocalSandboxPool {
             entry.snapshot_id = Some(snapshot_id);
             entry.dirty = false;
         }
-        self.notify.notify_one();
         self.changed.notify_waiters();
         let leased = LeasedSandbox {
             lease: lease.clone(),
@@ -493,7 +458,6 @@ impl LocalSandboxPool {
             command_timeout: self.policy.command_timeout,
             entries: Arc::clone(&self.entries),
             lifecycle: Arc::clone(&lifecycle),
-            notify: Arc::clone(&self.notify),
             changed: Arc::clone(&self.changed),
         };
         Ok((lease, leased))
@@ -563,7 +527,6 @@ impl LocalSandboxPool {
                 Err(error) if error.is::<NoReadyCapacity>() => {}
                 Err(error) => return Err(error),
             }
-            self.notify.notify_one();
             changed.await;
         }
     }
@@ -579,10 +542,7 @@ impl LocalSandboxPool {
 
     pub async fn heartbeat(&self, lease: &SandboxLease) -> Result<()> {
         let mut entries = self.entries.lock().await;
-        let entry = entries
-            .get_mut(&lease.entry_id)
-            .ok_or_else(|| anyhow!("entry missing"))?;
-        validate_lease(entry, lease)?;
+        let entry = leased_entry_mut(&mut entries, lease)?;
         let current_lease = entry
             .lease
             .as_mut()
@@ -592,7 +552,7 @@ impl LocalSandboxPool {
     }
 
     /// Rebuild the entry from its recipe baseline before reuse.
-    /// Use [`Self::reset`] to remove the entry without replenishing it.
+    /// Use [`Self::retire`] to destroy the entry without replenishing it.
     // This operation should remain behind the pool manager's authorization
     // boundary when the pool is exposed to remote workers.
     pub async fn release(&self, lease: &SandboxLease) -> Result<Option<SnapshotId>> {
@@ -600,10 +560,7 @@ impl LocalSandboxPool {
         let _operation = lifecycle.write().await;
         let (entry_id, request, handle, dirty) = {
             let mut entries = self.entries.lock().await;
-            let entry = entries
-                .get_mut(&lease.entry_id)
-                .ok_or_else(|| anyhow!("sandbox pool entry not found: {}", lease.entry_id))?;
-            validate_lease(entry, lease)?;
+            let entry = leased_entry_mut(&mut entries, lease)?;
             let handle = entry.handle.clone().ok_or_else(|| {
                 anyhow!("sandbox lease is still acquiring: {}", lease.fencing_token)
             })?;
@@ -614,7 +571,7 @@ impl LocalSandboxPool {
 
         let result = async {
             let snapshot_id = if dirty {
-                self.checkpoint(lease, handle).await?
+                self.checkpoint(&lease.worker_id, handle).await?
             } else {
                 None
             };
@@ -630,22 +587,19 @@ impl LocalSandboxPool {
             }
         };
 
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(snapshot_id)
     }
 
     // This operation should remain behind the pool manager's authorization
     // boundary when the pool is exposed to remote workers.
-    pub async fn reset(&self, lease: &SandboxLease) -> Result<()> {
+    /// Destroy the leased runtime and remove its entry; reconciliation replenishes capacity.
+    pub async fn retire(&self, lease: &SandboxLease) -> Result<()> {
         let lifecycle = self.entry_lifecycle(&lease.entry_id).await?;
         let _operation = lifecycle.write().await;
         let (entry_id, request) = {
             let mut entries = self.entries.lock().await;
-            let entry = entries
-                .get_mut(&lease.entry_id)
-                .ok_or_else(|| anyhow!("sandbox pool entry not found: {}", lease.entry_id))?;
-            validate_lease(entry, lease)?;
+            let entry = leased_entry_mut(&mut entries, lease)?;
             entry.state = PoolEntryState::Retiring;
             (entry.id.clone(), entry.request.clone())
         };
@@ -656,14 +610,12 @@ impl LocalSandboxPool {
         }
 
         self.entries.lock().await.remove(&entry_id);
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(())
     }
 
     /// Stop every runtime in the pool and reject subsequent acquisitions.
-    /// Call this after durable workspace state is saved and active users have
-    /// released their leases.
+    /// Dirty leased entries are checkpointed for their worker before they are destroyed.
     pub async fn drain(&self) -> Result<()> {
         let _reconcile = self.reconcile.lock().await;
         self.closed.store(true, Ordering::Release);
@@ -673,7 +625,6 @@ impl LocalSandboxPool {
                 .values_mut()
                 .map(|entry| {
                     entry.state = PoolEntryState::Retiring;
-                    entry.lease = None;
                     entry.id.clone()
                 })
                 .collect::<Vec<_>>()
@@ -686,25 +637,8 @@ impl LocalSandboxPool {
         Ok(())
     }
 
-    async fn health_check(&self, entry_id: &str) -> Result<()> {
-        let lifecycle = self.entry_lifecycle(entry_id).await?;
-        let _operation = lifecycle.write().await;
-        let handle = {
-            let mut entries = self.entries.lock().await;
-            let entry = entries
-                .get_mut(entry_id)
-                .ok_or_else(|| anyhow!("sandbox pool entry not found: {entry_id}"))?;
-            if entry.state != PoolEntryState::Ready {
-                bail!("sandbox pool entry is not ready: {entry_id}");
-            }
-            let handle = entry
-                .handle
-                .clone()
-                .ok_or_else(|| anyhow!("sandbox pool entry has no live handle: {entry_id}"))?;
-            entry.state = PoolEntryState::Checking;
-            handle
-        };
-
+    /// Check that a runtime still answers commands.
+    async fn health_check(&self, handle: &dyn ManagedSandboxHandle) -> Result<()> {
         let command = SandboxCommand {
             argv: self.policy.health_check_command.clone(),
             env: HashMap::new(),
@@ -712,66 +646,30 @@ impl LocalSandboxPool {
             cwd: None,
             timeout: Some(self.policy.health_check_timeout),
         };
-        let _permit = self.provider_operations.acquire().await.map_err(|error| {
-            anyhow!("sandbox pool provider-operation semaphore closed: {error}")
-        })?;
-        let result = time::timeout(self.policy.health_check_timeout, handle.exec(&command))
+        let output = time::timeout(self.policy.health_check_timeout, handle.exec(&command))
             .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result)
-            .and_then(|output| {
-                if output.ok {
-                    Ok(())
-                } else {
-                    bail!("health command failed")
-                }
-            });
-        if let Err(error) = result {
-            let mut entries = self.entries.lock().await;
-            if let Some(entry) = entries.get_mut(entry_id) {
-                entry.state = PoolEntryState::Retiring;
-                entry.last_health_check_at = Some(Instant::now());
-            }
-            self.notify.notify_one();
-            return Err(error);
-        }
-
-        let mut entries = self.entries.lock().await;
-        if let Some(entry) = entries.get_mut(entry_id) {
-            entry.state = PoolEntryState::Ready;
-            entry.last_health_check_at = Some(Instant::now());
-        }
-        self.changed.notify_waiters();
+            .map_err(anyhow::Error::from)??;
+        ensure!(output.ok, "sandbox health command failed");
         Ok(())
     }
 
-    /// Run one reconciliation pass. Provider calls are bounded and never run
-    /// while the entry table mutex is held.
+    /// Run one reconciliation pass. Provider calls never run while the entry
+    /// table mutex is held.
     pub async fn reconcile_once(&self) -> Result<()> {
         let _reconcile = self.reconcile.lock().await;
         self.evict_idle().await?;
-        let tasks = {
+        let retiring = {
             let mut entries = self.entries.lock().await;
             let now = Instant::now();
             entries
                 .values_mut()
-                .filter_map(|entry| {
-                    entry.reconciliation_task(now, self.policy.health_check_interval)
-                })
+                .filter_map(|entry| entry.needs_retirement(now).then(|| entry.id.clone()))
                 .collect::<Vec<_>>()
         };
 
-        for task in tasks {
-            let (result, entry_id, operation) = match task {
-                ReconcileTask::HealthCheck(entry_id) => {
-                    (self.health_check(&entry_id).await, entry_id, "health check")
-                }
-                ReconcileTask::Retire(entry_id) => {
-                    (self.retire_entry(&entry_id).await, entry_id, "retirement")
-                }
-            };
-            if let Err(error) = result {
-                tracing::warn!(%error, %entry_id, operation, "sandbox pool reconciliation task failed");
+        for entry_id in retiring {
+            if let Err(error) = self.retire_entry(&entry_id).await {
+                tracing::warn!(%error, %entry_id, "sandbox pool entry retirement failed");
             }
         }
 
@@ -787,30 +685,33 @@ impl LocalSandboxPool {
 
         loop {
             if *shutdown.borrow() {
-                self.closed.store(true, Ordering::Release);
-                self.changed.notify_waiters();
+                self.close();
                 return;
             }
+            // Subscribe before reconciling so a change made during the pass
+            // wakes the next one instead of being missed.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Err(error) = self.reconcile_once().await {
+                tracing::warn!(%error, "sandbox pool reconciliation failed");
+            }
             tokio::select! {
-                _ = self.notify.notified() => {
-                    if let Err(error) = self.reconcile_once().await {
-                        tracing::warn!(%error, "sandbox pool reconciliation failed");
-                    }
-                }
-                _ = interval.tick() => {
-                    if let Err(error) = self.reconcile_once().await {
-                        tracing::warn!(%error, "sandbox pool reconciliation failed");
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        self.closed.store(true, Ordering::Release);
-                        self.changed.notify_waiters();
+                _ = changed => {}
+                _ = interval.tick() => {}
+                shutdown_changed = shutdown.changed() => {
+                    if shutdown_changed.is_err() || *shutdown.borrow() {
+                        self.close();
                         return;
                     }
                 }
             }
         }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
     }
 
     async fn evict_idle(&self) -> Result<()> {
@@ -830,7 +731,6 @@ impl LocalSandboxPool {
                 .values_mut()
                 .filter(|entry| {
                     entry.state == PoolEntryState::Ready
-                        && entry.lease.is_none()
                         && now.duration_since(entry.last_used_at) >= self.capacity.idle_ttl
                 })
                 .collect::<Vec<_>>();
@@ -886,7 +786,6 @@ impl LocalSandboxPool {
                         last_used_at: Instant::now(),
                         dirty: false,
                         snapshot_id: None,
-                        last_health_check_at: None,
                         lifecycle: Arc::new(RwLock::new(())),
                     },
                 );
@@ -895,7 +794,7 @@ impl LocalSandboxPool {
             drop(entries);
             match self.acquire_from_recipe(request).await {
                 Ok(handle) => {
-                    let baseline_snapshot = *self.baseline_snapshot.lock().await;
+                    let baseline_snapshot = *self.baseline_snapshot.read().await;
                     let mut entries = self.entries.lock().await;
                     if let Some(entry) = entries.get_mut(&entry_id) {
                         entry.request.provider_state = handle.provider_state();
@@ -913,7 +812,6 @@ impl LocalSandboxPool {
                     return Err(error);
                 }
             }
-            self.notify.notify_one();
             self.changed.notify_waiters();
         }
     }
@@ -930,25 +828,38 @@ impl LocalSandboxPool {
     async fn retire_entry(&self, entry_id: &str) -> Result<()> {
         let lifecycle = self.entry_lifecycle(entry_id).await?;
         let _operation = lifecycle.write().await;
-        let (request, has_runtime) = {
+        let (request, has_runtime, unsaved) = {
             let mut entries = self.entries.lock().await;
-            let entry = entries
-                .get_mut(entry_id)
-                .ok_or_else(|| anyhow!("sandbox pool entry not found: {entry_id}"))?;
+            let entry = entry_mut(&mut entries, entry_id)?;
             if entry.state != PoolEntryState::Retiring {
                 return Ok(());
             }
+            let unsaved = match (&entry.lease, &entry.handle) {
+                (Some(lease), Some(handle)) if entry.dirty => {
+                    Some((lease.worker_id.clone(), Arc::clone(handle)))
+                }
+                _ => None,
+            };
             (
                 entry.request.clone(),
                 entry.handle.is_some() || entry.request.provider_state.is_some(),
+                unsaved,
             )
         };
+
+        // An entry can be retired while its worker still has unsaved work, for
+        // example when its lease expires. Keep that work reachable through the
+        // snapshot store instead of destroying it with the runtime.
+        if let Some((owner_id, handle)) = unsaved
+            && let Err(error) = self.checkpoint(&owner_id, handle).await
+        {
+            tracing::warn!(%error, %entry_id, %owner_id, "failed checkpointing sandbox before retirement");
+        }
 
         if has_runtime && let Err(error) = self.terminate_with_provider(request).await {
             return Err(error);
         }
         self.entries.lock().await.remove(entry_id);
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(())
     }
@@ -972,10 +883,47 @@ impl LocalSandboxPool {
         &self,
         request: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        // Fast path: an established baseline only needs the read lock, so
+        // concurrent resets and replenishments never wait on each other.
+        let mut unusable = None;
+        if let Some(store) = &self.snapshot_store
+            && let Some(snapshot_id) = *self.baseline_snapshot.read().await
+        {
+            match self
+                .restore_baseline(store.as_ref(), snapshot_id, request.clone())
+                .await
+            {
+                Ok(handle) => return Ok(handle),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        %snapshot_id,
+                        "pool baseline restore failed; recreating from recipe"
+                    );
+                    unusable = Some(snapshot_id);
+                }
+            }
+        }
+
         // Serialize baseline restore/fallback/save so concurrent replacements
         // cannot create competing baselines.
-        let mut baseline = self.baseline_snapshot.lock().await;
+        let mut baseline = self.baseline_snapshot.write().await;
         if let Some(store) = &self.snapshot_store {
+            if let Some(snapshot_id) = unusable
+                && *baseline == Some(snapshot_id)
+            {
+                if let Err(delete_error) = store
+                    .delete(&self.key.pool_id, &self.baseline_owner_id(), snapshot_id)
+                    .await
+                {
+                    tracing::warn!(
+                        %delete_error,
+                        %snapshot_id,
+                        "failed deleting unusable pool baseline"
+                    );
+                }
+                *baseline = None;
+            }
             if baseline.is_none() {
                 *baseline = store
                     .list(&self.key.pool_id, &self.baseline_owner_id())
@@ -985,17 +933,17 @@ impl LocalSandboxPool {
             }
             let snapshot_id = *baseline;
             if let Some(snapshot_id) = snapshot_id {
-                let restored = async {
-                    let snapshot = store
-                        .load(&self.key.pool_id, &self.baseline_owner_id(), snapshot_id)
-                        .await?;
-                    self.acquire_from_snapshot(request.clone(), snapshot).await
-                }
-                .await;
-                match restored {
+                match self
+                    .restore_baseline(store.as_ref(), snapshot_id, request.clone())
+                    .await
+                {
                     Ok(handle) => return Ok(handle),
                     Err(error) => {
-                        tracing::warn!(%error, %snapshot_id, "pool baseline restore failed; recreating from recipe");
+                        tracing::warn!(
+                            %error,
+                            %snapshot_id,
+                            "pool baseline restore failed; recreating from recipe"
+                        );
                         if let Err(delete_error) = store
                             .delete(&self.key.pool_id, &self.baseline_owner_id(), snapshot_id)
                             .await
@@ -1007,21 +955,13 @@ impl LocalSandboxPool {
                 }
             }
         }
-        let handle = {
-            let _permit = self.provider_operations.acquire().await.map_err(|error| {
-                anyhow!("sandbox pool provider-operation semaphore closed: {error}")
-            })?;
-            time::timeout(
-                self.policy.provider_timeout,
-                self.provisioner.acquire(self.backend.as_ref(), request),
-            )
-            .await??
-        };
+        let handle = time::timeout(
+            self.policy.provider_timeout,
+            self.provisioner.acquire(self.backend.as_ref(), request),
+        )
+        .await??;
         if let Some(store) = &self.snapshot_store {
             let saved = async {
-                let _permit = self.provider_operations.acquire().await.map_err(|error| {
-                    anyhow!("sandbox pool provider-operation semaphore closed: {error}")
-                })?;
                 let payload =
                     time::timeout(self.policy.provider_timeout, handle.snapshot()).await??;
                 store
@@ -1039,14 +979,23 @@ impl LocalSandboxPool {
         Ok(handle)
     }
 
+    async fn restore_baseline(
+        &self,
+        store: &dyn SandboxPoolSnapshotStore,
+        snapshot_id: SnapshotId,
+        request: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let snapshot = store
+            .load(&self.key.pool_id, &self.baseline_owner_id(), snapshot_id)
+            .await?;
+        self.acquire_from_snapshot(request, snapshot).await
+    }
+
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
         snapshot: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let _permit = self.provider_operations.acquire().await.map_err(|error| {
-            anyhow!("sandbox pool provider-operation semaphore closed: {error}")
-        })?;
         time::timeout(
             self.policy.provider_timeout,
             self.backend.acquire_from_snapshot(request, snapshot),
@@ -1073,9 +1022,6 @@ impl LocalSandboxPool {
     }
 
     async fn terminate_with_provider(&self, request: SandboxRequest) -> Result<()> {
-        let _permit = self.provider_operations.acquire().await.map_err(|error| {
-            anyhow!("sandbox pool provider-operation semaphore closed: {error}")
-        })?;
         time::timeout(
             self.policy.provider_timeout,
             self.backend.terminate(request),
@@ -1085,20 +1031,17 @@ impl LocalSandboxPool {
 
     async fn checkpoint(
         &self,
-        lease: &SandboxLease,
+        owner_id: &str,
         handle: Arc<dyn ManagedSandboxHandle>,
     ) -> Result<Option<SnapshotId>> {
         let Some(store) = &self.snapshot_store else {
             return Ok(None);
         };
-        let _permit = self.provider_operations.acquire().await.map_err(|error| {
-            anyhow!("sandbox pool provider-operation semaphore closed: {error}")
-        })?;
         let payload = time::timeout(self.policy.provider_timeout, handle.snapshot())
             .await
             .map_err(anyhow::Error::from)??;
         store
-            .save(&self.key.pool_id, &lease.worker_id, payload)
+            .save(&self.key.pool_id, owner_id, payload)
             .await
             .map(Some)
     }
@@ -1106,18 +1049,15 @@ impl LocalSandboxPool {
     async fn reset_runtime(&self, entry_id: &str, request: SandboxRequest) -> Result<()> {
         self.terminate_with_provider(request.clone()).await?;
         let handle = self.acquire_from_recipe(request.clone()).await?;
-        let baseline_snapshot = *self.baseline_snapshot.lock().await;
+        let baseline_snapshot = *self.baseline_snapshot.read().await;
         let mut entries = self.entries.lock().await;
-        let entry = entries
-            .get_mut(entry_id)
-            .ok_or_else(|| anyhow!("sandbox pool entry disappeared during reset"))?;
+        let entry = entry_mut(&mut entries, entry_id)?;
         entry.request.provider_state = handle.provider_state();
         entry.handle = Some(handle);
         entry.snapshot_id = baseline_snapshot;
         entry.dirty = false;
         entry.state = PoolEntryState::Ready;
         entry.last_used_at = Instant::now();
-        entry.last_health_check_at = None;
         Ok(())
     }
 
@@ -1126,7 +1066,6 @@ impl LocalSandboxPool {
         if let Some(entry) = entries.get_mut(entry_id) {
             quarantine_entry(entry);
         }
-        self.notify.notify_one();
         self.changed.notify_waiters();
     }
 
@@ -1137,8 +1076,6 @@ impl LocalSandboxPool {
         {
             entry.state = PoolEntryState::Retiring;
             entry.lease = None;
-            entry.handle = None;
-            self.notify.notify_one();
             self.changed.notify_waiters();
         }
     }
@@ -1158,8 +1095,8 @@ impl ManagedSandboxPool for LocalSandboxPool {
         LocalSandboxPool::release(self, lease).await
     }
 
-    async fn reset(&self, lease: &SandboxLease) -> Result<()> {
-        LocalSandboxPool::reset(self, lease).await
+    async fn retire(&self, lease: &SandboxLease) -> Result<()> {
+        LocalSandboxPool::retire(self, lease).await
     }
 
     async fn drain(&self) -> Result<()> {
@@ -1176,7 +1113,6 @@ struct LeasedSandbox {
     command_timeout: Duration,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
     lifecycle: Arc<RwLock<()>>,
-    notify: Arc<Notify>,
     changed: Arc<Notify>,
 }
 
@@ -1230,7 +1166,6 @@ impl LeasedSandbox {
             true
         };
         if quarantined {
-            self.notify.notify_one();
             self.changed.notify_waiters();
         }
     }
@@ -1255,6 +1190,63 @@ impl std::fmt::Display for NoReadyCapacity {
     }
 }
 impl std::error::Error for NoReadyCapacity {}
+
+fn validate_key(key: &SandboxPoolKey) -> Result<()> {
+    ensure!(!key.pool_id.trim().is_empty(), "pool id must not be empty");
+    ensure!(
+        !key.recipe_id.trim().is_empty(),
+        "recipe id must not be empty"
+    );
+    Ok(())
+}
+
+fn validate_capacity(capacity: &PoolCapacity) -> Result<()> {
+    ensure!(capacity.warm_size > 0, "warm size must be positive");
+    ensure!(
+        capacity.warm_size <= capacity.max_total,
+        "warm size must not exceed the maximum pool size"
+    );
+    ensure!(!capacity.lease_ttl.is_zero(), "lease ttl must be positive");
+    Ok(())
+}
+
+fn validate_policy(policy: &PoolPolicy) -> Result<()> {
+    ensure!(
+        policy
+            .health_check_command
+            .first()
+            .is_some_and(|command| !command.trim().is_empty()),
+        "health check command must not be empty"
+    );
+    for (name, duration) in [
+        ("provider timeout", policy.provider_timeout),
+        ("health check timeout", policy.health_check_timeout),
+        ("reconcile interval", policy.reconcile_interval),
+        ("command timeout", policy.command_timeout),
+    ] {
+        ensure!(!duration.is_zero(), "{name} must be positive");
+    }
+    Ok(())
+}
+
+fn entry_mut<'a>(
+    entries: &'a mut HashMap<String, PoolEntry>,
+    entry_id: &str,
+) -> Result<&'a mut PoolEntry> {
+    entries
+        .get_mut(entry_id)
+        .ok_or_else(|| anyhow!("sandbox pool entry not found: {entry_id}"))
+}
+
+/// Look up the entry a lease refers to and reject stale or fenced-out leases.
+fn leased_entry_mut<'a>(
+    entries: &'a mut HashMap<String, PoolEntry>,
+    lease: &SandboxLease,
+) -> Result<&'a mut PoolEntry> {
+    let entry = entry_mut(entries, &lease.entry_id)?;
+    validate_lease(entry, lease)?;
+    Ok(entry)
+}
 
 fn quarantine_entry(entry: &mut PoolEntry) {
     entry.state = PoolEntryState::Retiring;
@@ -1467,7 +1459,18 @@ mod tests {
             "slow-sandbox"
         }
 
-        async fn exec(&self, _command: &SandboxCommand) -> Result<SandboxCommandOutput> {
+        async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
+            // Answers the acquire-time health check, hangs on everything else.
+            if command.argv == PoolPolicy::default().health_check_command {
+                return Ok(SandboxCommandOutput {
+                    ok: true,
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    command: command.argv.clone(),
+                    cwd: "/".to_string(),
+                });
+            }
             time::sleep(Duration::from_secs(1)).await;
             unreachable!("the lease wrapper should time out this call")
         }
@@ -1633,7 +1636,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(pool.entries().await[0].snapshot_id, Some(snapshot_id));
-        pool.reset(&acquired.lease).await.unwrap();
+        pool.retire(&acquired.lease).await.unwrap();
     }
 
     #[tokio::test]
@@ -1678,7 +1681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_terminates_and_removes_entry() {
+    async fn retire_terminates_and_removes_entry() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
         pool.insert_entry(PoolEntry::new("entry".to_string(), request("entry"), None))
@@ -1686,13 +1689,13 @@ mod tests {
             .unwrap();
 
         let (lease, _) = pool.try_acquire("worker-a").await.unwrap();
-        pool.reset(&lease).await.unwrap();
+        pool.retire(&lease).await.unwrap();
         assert_eq!(pool.entry_count().await, 0);
         assert_eq!(backend.terminate_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn reset_failure_keeps_entry_retiring() {
+    async fn retire_failure_keeps_entry_retiring() {
         let backend = Arc::new(FakeBackend::new());
         backend.fail_terminate.store(true, Ordering::SeqCst);
         let pool = pool(Arc::clone(&backend));
@@ -1701,12 +1704,12 @@ mod tests {
             .unwrap();
 
         let (lease, _) = pool.try_acquire("worker-a").await.unwrap();
-        assert!(pool.reset(&lease).await.is_err());
+        assert!(pool.retire(&lease).await.is_err());
         assert_eq!(state(&pool, "entry").await, PoolEntryState::Retiring);
     }
 
     #[tokio::test]
-    async fn health_check_marks_failed_entry_retiring() {
+    async fn acquire_retires_an_entry_that_fails_its_health_check() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
         let handle: Arc<dyn ManagedSandboxHandle> = Arc::new(FakeHandle {
@@ -1721,10 +1724,24 @@ mod tests {
         .await
         .unwrap();
 
-        pool.health_check("entry").await.unwrap();
+        assert!(pool.try_acquire("worker").await.is_ok());
         backend.healthy.store(false, Ordering::SeqCst);
-        assert!(pool.health_check("entry").await.is_err());
-        assert_eq!(state(&pool, "entry").await, PoolEntryState::Retiring);
+        pool.insert_entry(PoolEntry::new(
+            "unhealthy".to_string(),
+            request("unhealthy"),
+            Some(Arc::new(FakeHandle {
+                id: "fake-sandbox-unhealthy".to_string(),
+                healthy: Arc::clone(&backend.healthy),
+            })),
+        ))
+        .await
+        .unwrap();
+
+        let Err(error) = pool.try_acquire("worker").await else {
+            panic!("an unhealthy entry must not be leased");
+        };
+        assert!(error.is::<NoReadyCapacity>());
+        assert_eq!(state(&pool, "unhealthy").await, PoolEntryState::Retiring);
     }
 
     #[tokio::test]
@@ -2039,20 +2056,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_checks_do_not_extend_idle_lifetime() {
-        let backend = Arc::new(FakeBackend::new());
-        let pool = pool(backend);
-        pool.reconcile_once().await.unwrap();
-        let (id, last_used) = {
-            let entries = pool.entries.lock().await;
-            let entry = entries.values().next().unwrap();
-            (entry.id.clone(), entry.last_used_at)
-        };
-        pool.health_check(&id).await.unwrap();
-        assert_eq!(pool.entries.lock().await[&id].last_used_at, last_used);
-    }
-
-    #[tokio::test]
     async fn idle_eviction_is_lru_and_preserves_warm_size() {
         let backend = Arc::new(FakeBackend::new());
         let mut pool = pool(Arc::clone(&backend));
@@ -2085,17 +2088,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_check_cannot_change_active_lease() {
-        let backend = Arc::new(FakeBackend::new());
-        let pool = pool(backend);
-        pool.reconcile_once().await.unwrap();
-        let (lease, handle) = pool.try_acquire("active").await.unwrap();
-        assert!(pool.health_check(&lease.entry_id).await.is_err());
-        assert!(handle.exec(&command()).await.unwrap().ok);
-        assert_eq!(state(&pool, &lease.entry_id).await, PoolEntryState::Leased);
-    }
-
-    #[tokio::test]
     async fn expired_handles_are_fenced_and_replaced() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
@@ -2116,6 +2108,61 @@ mod tests {
         assert_eq!(backend.terminate_count.load(Ordering::SeqCst), 1);
         let (_, replacement) = pool.try_acquire("replacement").await.unwrap();
         assert_ne!(handle.id(), replacement.id());
+    }
+
+    #[tokio::test]
+    async fn expired_lease_is_checkpointed_before_the_entry_is_retired() {
+        let backend = Arc::new(FakeBackend::new());
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalSandboxPoolStore::new(
+            directory.path(),
+            SnapshotRetentionPolicy::default(),
+        ));
+        let pool = pool_with_store(backend, Some(store.clone()));
+        pool.reconcile_once().await.unwrap();
+        let (lease, handle) = pool.try_acquire("expired").await.unwrap();
+        handle.exec(&command()).await.unwrap();
+        pool.entries
+            .lock()
+            .await
+            .get_mut(&lease.entry_id)
+            .unwrap()
+            .lease
+            .as_mut()
+            .unwrap()
+            .expires_at = Instant::now();
+
+        pool.reconcile_once().await.unwrap();
+
+        let checkpoints = store.list("pool", "expired").await.unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(
+            store
+                .load("pool", "expired", checkpoints[0].snapshot_id)
+                .await
+                .unwrap()
+                .bytes,
+            bytes::Bytes::from_static(b"fake workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_checkpoints_dirty_leased_entries() {
+        let backend = Arc::new(FakeBackend::new());
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalSandboxPoolStore::new(
+            directory.path(),
+            SnapshotRetentionPolicy::default(),
+        ));
+        let pool = pool_with_store(backend, Some(store.clone()));
+        pool.reconcile_once().await.unwrap();
+        let (_lease, sandbox) = pool.try_acquire("worker").await.unwrap();
+        sandbox.exec(&command()).await.unwrap();
+
+        pool.drain().await.unwrap();
+
+        assert_eq!(store.list("pool", "worker").await.unwrap().len(), 1);
+        assert_eq!(pool.entry_count().await, 0);
     }
 
     #[tokio::test]
@@ -2155,6 +2202,7 @@ mod tests {
         .unwrap();
         let (lease, sandbox) = pool.try_acquire("worker").await.unwrap();
         let mut timed = command();
+        timed.argv = vec!["sleep".into()];
         timed.timeout = Some(Duration::from_millis(1));
 
         assert!(sandbox.exec(&timed).await.is_err());

@@ -18,6 +18,7 @@ pub trait SecretResolver: Send + Sync {
 
 #[derive(Debug, Clone, Copy)]
 pub struct RecipePolicy {
+    /// Upper bound for one recipe command. The sandbox process is not killed on timeout; callers are expected to discard the sandbox when a recipe fails.
     pub command_timeout: Duration,
     pub max_output_bytes_per_stream: usize,
 }
