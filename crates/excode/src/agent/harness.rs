@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cost::PricingTable;
 use executor::{
     BraintrustRuntimeConfig, ExecutorHarnessRuntime, ModelClient, RouterModelClient, SharedHarness,
     SharedHarnessBacked,
@@ -32,10 +33,14 @@ impl CodingHarness<RouterModelClient> {
         exoharness: Arc<dyn ExoHarness>,
         runtime_config: Option<BraintrustRuntimeConfig>,
         env: HashMap<String, String>,
+        pricing: Arc<PricingTable>,
     ) -> Self {
         let model = Arc::new(RouterModelClient::new(env));
-        let executor =
-            CodingExecutor::new(model, Arc::new(CodingToolRuntime::with_default_tools()));
+        let executor = CodingExecutor::with_pricing(
+            model,
+            Arc::new(CodingToolRuntime::with_default_tools()),
+            pricing,
+        );
         let runtime = ExecutorHarnessRuntime::new(executor, runtime_config);
         Self {
             inner: SharedHarness::new(exoharness, runtime),
@@ -51,6 +56,7 @@ impl CodingHarness<RouterModelClient> {
             Arc::new(BasicExoHarness::new(exo_config).await?),
             runtime_config,
             env,
+            Arc::new(PricingTable::empty()),
         ))
     }
 }

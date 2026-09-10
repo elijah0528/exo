@@ -3148,6 +3148,7 @@ async fn instantiate_harness(
             exoharness,
             runtime_config,
             env_vars,
+            pricing,
         )),
         HarnessKind::Exo => Arc::new(
             TypeScriptHarness::<ExoToolRuntime>::exo_from_root(

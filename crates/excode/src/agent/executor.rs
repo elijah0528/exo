@@ -58,13 +58,13 @@ where
 
     async fn prepare_conversation(
         &self,
-        _agent: &dyn AgentHandle,
+        agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
         agent_config: &AgentConfig,
         conversation_config: &ConversationConfig,
     ) -> Result<()> {
         self.tools
-            .prepare_conversation(_agent, conversation, agent_config, conversation_config)
+            .prepare_conversation(agent, conversation, agent_config, conversation_config)
             .await
     }
 
