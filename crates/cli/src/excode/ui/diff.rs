@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use super::component::{Component, EventFlow, RenderCtx};
-use super::scroll::{Scroll, render_scrollbar};
+use super::scroll::Scroll;
 use super::theme::Theme;
 use super::wrap::wrap_line;
 
@@ -247,7 +247,7 @@ impl Component for DiffView {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let text_width = area.width.saturating_sub(1).max(1);
+        let text_width = area.width.max(1);
         let lines = diff_lines(&self.files, text_width, ctx.theme);
         self.lines.set(lines.len());
         let viewport = usize::from(area.height);
@@ -256,7 +256,6 @@ impl Component for DiffView {
         for (row, line) in lines.iter().skip(top).take(viewport).enumerate() {
             buf.set_line(area.x, area.y + row as u16, line, text_width);
         }
-        render_scrollbar(area, buf, ctx.theme, lines.len(), top);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventFlow {

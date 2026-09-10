@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use super::component::{Component, EventFlow, RenderCtx};
-use super::scroll::{Scroll, render_scrollbar};
+use super::scroll::Scroll;
 use super::theme::Theme;
 
 /// One entry in a transcript.
@@ -67,6 +67,13 @@ impl Transcript {
         self.scroll.is_pinned_to_bottom()
     }
 
+    /// Advance an in-progress scroll animation.
+    pub fn tick(&mut self) {
+        let cache = self.cache.borrow();
+        self.scroll
+            .tick(cache.lines.len(), self.viewport.get().max(1));
+    }
+
     /// Drop the cached layout, e.g. after the theme changes.
     pub fn invalidate(&mut self) {
         *self.cache.borrow_mut() = LayoutCache::default();
@@ -81,11 +88,13 @@ impl Transcript {
                 return cache;
             }
         }
-        let lines = self
-            .cells
-            .iter()
-            .flat_map(|cell| cell.lines(width, theme))
-            .collect();
+        let mut lines = Vec::new();
+        for (index, cell) in self.cells.iter().enumerate() {
+            lines.extend(cell.lines(width, theme));
+            if index + 1 < self.cells.len() {
+                lines.push(Line::default());
+            }
+        }
         *self.cache.borrow_mut() = LayoutCache {
             width,
             cells: self.cells.len(),
@@ -110,8 +119,7 @@ impl Component for Transcript {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Leave a column for the scrollbar so wrapping matches what is drawn.
-        let text_width = area.width.saturating_sub(1).max(1);
+        let text_width = area.width.max(1);
         let cache = self.lines(text_width, ctx.theme);
         let viewport = usize::from(area.height);
         self.viewport.set(viewport);
@@ -119,7 +127,6 @@ impl Component for Transcript {
         for (row, line) in cache.lines.iter().skip(top).take(viewport).enumerate() {
             buf.set_line(area.x, area.y + row as u16, line, text_width);
         }
-        render_scrollbar(area, buf, ctx.theme, cache.lines.len(), top);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventFlow {

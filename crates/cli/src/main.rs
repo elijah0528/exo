@@ -10,7 +10,6 @@ mod naming_tests;
 mod render;
 #[cfg(test)]
 mod repl_tests;
-mod sandbox_pool_tui;
 #[cfg(test)]
 mod secret_tests;
 mod tools;
@@ -590,7 +589,7 @@ enum Commands {
     /// Inspect and operate a managed sandbox pool in a terminal UI.
     SandboxPool {
         #[command(flatten)]
-        args: sandbox_pool_tui::SandboxPoolArgs,
+        args: excode::ExcodeArgs,
     },
     /// The excode terminal: sandbox pool, coding agent, and diffs.
     Excode {
@@ -1215,7 +1214,7 @@ async fn main() -> Result<()> {
     let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
     let env_vars = env.clone().into_vars();
     if let Commands::SandboxPool { args } = &cli.command {
-        return sandbox_pool_tui::run(&cli.root, args.clone(), env_vars).await;
+        return excode::run(&cli.root, args.clone(), env_vars).await;
     }
     if let Commands::Excode { args } = &cli.command {
         return excode::run(&cli.root, args.clone(), env_vars).await;

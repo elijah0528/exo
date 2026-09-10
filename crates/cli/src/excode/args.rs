@@ -26,9 +26,6 @@ pub struct ExcodeArgs {
     /// Container image used by the Docker backend.
     #[arg(long, default_value_t = default_docker_image())]
     pub image: String,
-    /// Start with the sandbox utilization panel visible.
-    #[arg(long)]
-    pub debug: bool,
 }
 
 impl ExcodeArgs {

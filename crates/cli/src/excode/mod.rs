@@ -9,6 +9,7 @@
 
 mod app;
 mod args;
+mod clipboard;
 mod command;
 mod dashboard;
 mod session;
@@ -49,7 +50,7 @@ pub async fn run(root: &Path, args: ExcodeArgs, env_vars: HashMap<String, String
             ..Default::default()
         },
     );
-    let result = app::App::new(session, agent, args.debug).run().await;
+    let result = app::App::new(session, agent).run().await;
 
     shutdown
         .send(true)

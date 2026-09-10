@@ -4,6 +4,9 @@
 //! from [`super::ui`]. Adding a view means adding a component and one arm to
 //! the dispatch below, not editing a monolithic draw function.
 
+use std::cell::RefCell;
+use std::future::Future;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,20 +17,26 @@ use crossterm::event::{
 };
 use excode::{CodingAgent, CodingAgentEvent, CodingResult};
 use executor::RouterModelClient;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_stream::StreamExt;
 
+use super::clipboard;
 use super::command::{COMMANDS, Command, parse};
-use super::dashboard::{DebugPanel, SandboxTable, SnapshotList};
+use super::dashboard::SnapshotList;
 use super::session::Session;
-use super::ui::cells::{CommandCell, DiffCell, Level, NoteCell};
+use super::ui::activity::Activity;
+use super::ui::cells::{
+    AssistantCell, CommandCell, DiffCell, Level, NoteCell, StreamingCell, ToolCell, ToolState,
+    UserCell,
+};
 use super::ui::component::{Component, RenderCtx};
 use super::ui::diff::DiffView;
 use super::ui::overlay::render_overlay;
 use super::ui::panel::Panel;
-use super::ui::status::{KeyHint, Spinner, render_status_bar};
+use super::ui::status::{KeyHint, render_status_bar};
 use super::ui::text_input::{InputEvent, TextInput};
 use super::ui::theme::Theme;
 use super::ui::transcript::Transcript;
@@ -36,11 +45,16 @@ type ChatTask = tokio::task::JoinHandle<Result<CodingResult>>;
 
 const HINTS: &[KeyHint] = &[
     KeyHint::new("enter", "send"),
+    KeyHint::new("ctrl-o", "copy"),
+    KeyHint::new("alt-r", "select"),
     KeyHint::new("/help", "commands"),
     KeyHint::new("ctrl-d", "diff"),
-    KeyHint::new("ctrl-g", "debug"),
     KeyHint::new("ctrl-c", "quit"),
 ];
+
+const HORIZONTAL_PADDING: u16 = 3;
+const TOP_PADDING: u16 = 2;
+const BOTTOM_PADDING: u16 = 1;
 
 /// Which surface receives keys that the input does not claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +67,7 @@ enum Focus {
 enum Overlay {
     Diff(DiffView),
     Help,
+    Snapshots,
 }
 
 pub struct App {
@@ -60,36 +75,40 @@ pub struct App {
     theme: Theme,
     transcript: Transcript,
     input: TextInput,
-    table: SandboxTable,
+    activity: Option<Activity>,
     focus: Focus,
     overlay: Option<Overlay>,
-    debug: bool,
-    spinner: Spinner,
     agent: CodingAgent<RouterModelClient>,
     chat_task: Option<ChatTask>,
     chat_events: Option<UnboundedReceiver<CodingAgentEvent>>,
-    thinking_since: Option<Instant>,
-    streaming: String,
+    streaming_cell: Option<Rc<RefCell<String>>>,
+    streamed_response: bool,
+    active_tool: Option<Rc<RefCell<ToolState>>>,
+    latest_response: Option<String>,
+    last_frame: Option<Buffer>,
+    mouse_capture: bool,
     should_quit: bool,
 }
 
 impl App {
-    pub fn new(session: Session, agent: CodingAgent<RouterModelClient>, debug: bool) -> Self {
+    pub fn new(session: Session, agent: CodingAgent<RouterModelClient>) -> Self {
         let mut app = Self {
             session,
             theme: Theme::dark(),
             transcript: Transcript::new(),
             input: TextInput::new("› "),
-            table: SandboxTable::new(),
+            activity: None,
             focus: Focus::Input,
             overlay: None,
-            debug,
-            spinner: Spinner::new(),
             agent,
             chat_task: None,
             chat_events: None,
-            thinking_since: None,
-            streaming: String::new(),
+            streaming_cell: None,
+            streamed_response: false,
+            active_tool: None,
+            latest_response: None,
+            last_frame: None,
+            mouse_capture: true,
             should_quit: false,
         };
         app.note(Level::Info, "excode ready — /help lists commands");
@@ -109,10 +128,10 @@ impl App {
         let mut events = EventStream::new();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
         let mut refresh = tokio::time::interval(Duration::from_secs(1));
+        let mut ui_tick = tokio::time::interval(Duration::from_millis(16));
         let result = async {
             loop {
-                self.table.update(&self.session.rows(), &self.theme);
-                terminal.draw(|frame| self.draw(frame))?;
+                self.redraw(&mut terminal)?;
                 if self.should_quit {
                     break Ok(());
                 }
@@ -121,13 +140,15 @@ impl App {
                     event = Self::next_chat_event(&mut self.chat_events) => {
                         if let Some(event) = event {
                             self.on_chat_event(event);
+                        } else {
+                            self.chat_events = None;
                         }
                     }
                     event = events.next() => {
                         let Some(event) = event else { break Ok(()); };
                         match event? {
                             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                                self.on_key(key).await?;
+                                self.on_key(key, &mut terminal).await?;
                             }
                             Event::Mouse(mouse) => {
                                 self.transcript.handle_mouse(mouse);
@@ -141,6 +162,7 @@ impl App {
                         }
                     }
                     _ = refresh.tick() => self.session.refresh().await?,
+                    _ = ui_tick.tick() => self.transcript.tick(),
                 }
             }
         }
@@ -151,70 +173,33 @@ impl App {
     }
 
     fn draw(&self, frame: &mut ratatui::Frame) {
-        let area = frame.area();
-        let debug_height = if self.debug { 8 } else { 0 };
+        let terminal_area = frame.area();
+        let area = content_area(terminal_area);
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(6),
-                Constraint::Length(debug_height),
+                Constraint::Min(8),
+                Constraint::Length(1),
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
             .split(area);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(40), Constraint::Length(60)])
-            .split(rows[0]);
-        let sidebar = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(body[1]);
-
         let ctx = RenderCtx::new(&self.theme);
         let buf = frame.buffer_mut();
 
-        let transcript_panel = Panel::new(self.transcript_title());
-        let transcript_area = transcript_panel.inner(body[0]);
-        transcript_panel.render(body[0], buf, ctx.focused(self.focus == Focus::Transcript));
-        self.transcript.render(transcript_area, buf, ctx);
+        self.transcript.render(rows[0], buf, ctx);
 
-        let table_panel = Panel::new(Line::from(Span::styled("Sandboxes", self.theme.title)));
-        let table_area = table_panel.inner(sidebar[0]);
-        table_panel.render(sidebar[0], buf, ctx);
-        self.table.render(table_area, buf, ctx);
-
-        let snapshot_panel = Panel::new(Line::from(Span::styled("Snapshots", self.theme.title)));
-        let snapshot_area = snapshot_panel.inner(sidebar[1]);
-        snapshot_panel.render(sidebar[1], buf, ctx);
-        SnapshotList::new(self.session.snapshots(), self.session.has_snapshot_store()).render(
-            snapshot_area,
-            buf,
-            ctx,
-        );
-
-        if self.debug {
-            let debug_panel = Panel::new(Line::from(Span::styled(
-                "Sandbox utilization",
-                self.theme.title,
-            )));
-            let debug_area = debug_panel.inner(rows[1]);
-            debug_panel.render(rows[1], buf, ctx);
-            DebugPanel::new(
-                self.session.utilization(),
-                self.session.detached_count(),
-                self.session.is_dirty(),
-            )
-            .render(debug_area, buf, ctx);
+        if let Some(activity) = &self.activity {
+            activity.render(rows[1], buf, ctx);
         }
-
-        let input_panel = Panel::new(Line::from(Span::styled(
-            self.input_title(),
-            self.theme.accent,
-        )));
-        let input_area = input_panel.inner(rows[2]);
-        input_panel.render(rows[2], buf, ctx.focused(self.focus == Focus::Input));
-        self.input.render(input_area, buf, ctx);
+        let input_area = Panel::new(Line::from(Span::styled(
+            " message or /command ",
+            self.theme.title,
+        )))
+        .footer(Line::from(Span::styled(" enter send ", self.theme.dim)))
+        .render(rows[2], buf, ctx.focused(self.focus == Focus::Input));
+        self.input
+            .render(input_area, buf, ctx.focused(self.focus == Focus::Input));
 
         render_status_bar(rows[3], buf, ctx, self.status_line(), HINTS);
 
@@ -222,7 +207,7 @@ impl App {
             Some(Overlay::Diff(view)) => {
                 let (added, removed) = view.stats();
                 render_overlay(
-                    area,
+                    terminal_area,
                     buf,
                     ctx,
                     Line::from(vec![
@@ -241,7 +226,7 @@ impl App {
                 );
             }
             Some(Overlay::Help) => render_overlay(
-                area,
+                terminal_area,
                 buf,
                 ctx,
                 Line::from(Span::styled("Commands", self.theme.title)),
@@ -249,6 +234,19 @@ impl App {
                 /*width_pct*/ 60,
                 /*height_pct*/ 60,
                 &HelpView,
+            ),
+            Some(Overlay::Snapshots) => render_overlay(
+                terminal_area,
+                buf,
+                ctx,
+                Line::from(Span::styled("Snapshots", self.theme.title)),
+                Some(Line::from(Span::styled(
+                    " esc close   /c [#] connect ",
+                    self.theme.dim,
+                ))),
+                78,
+                68,
+                &SnapshotList::new(self.session.snapshots(), self.session.has_snapshot_store()),
             ),
             None => {}
         }
@@ -261,41 +259,23 @@ impl App {
         }
     }
 
-    fn transcript_title(&self) -> Line<'static> {
-        let mut spans = vec![Span::styled("Session", self.theme.title)];
-        if let Some(started) = self.thinking_since {
-            spans.push(Span::styled(
-                format!(
-                    "  {} thinking {}s",
-                    self.spinner.frame(),
-                    started.elapsed().as_secs()
-                ),
-                self.theme.warn,
-            ));
-        }
-        if !self.transcript.is_following_tail() {
-            spans.push(Span::styled("  scrolled", self.theme.dim));
-        }
-        Line::from(spans)
-    }
-
-    fn input_title(&self) -> String {
-        match self.session.active() {
-            Some(active) => format!("attached {}", super::session::short_id(active.sandbox.id())),
-            None => "no sandbox attached".to_string(),
-        }
+    fn redraw(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+        let frame = terminal.draw(|frame| self.draw(frame))?;
+        self.last_frame = Some(frame.buffer.clone());
+        Ok(())
     }
 
     fn status_line(&self) -> Line<'static> {
-        let used = self.session.utilization();
+        let connection = if self.session.active().is_some() {
+            "connected"
+        } else {
+            "disconnected"
+        };
         Line::from(vec![
+            Span::styled(format!(" {connection} "), self.theme.accent),
             Span::styled(
-                format!(" ready {}/{} ", used.ready, used.warm_size),
-                self.theme.success,
-            ),
-            Span::styled(
-                format!("leased {}/{} ", used.leased, used.max_total),
-                self.theme.warn,
+                format!("snapshots {} ", self.session.snapshots().len()),
+                self.theme.dim,
             ),
             Span::styled(
                 if self.session.is_dirty() {
@@ -308,10 +288,18 @@ impl App {
         ])
     }
 
-    async fn on_key(&mut self, key: KeyEvent) -> Result<()> {
+    async fn on_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<()> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && key.code == KeyCode::Char('c') {
             self.cancel_or_quit();
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('r') {
+            self.toggle_selection_mode();
             return Ok(());
         }
         if let Some(overlay) = self.overlay.as_mut() {
@@ -327,11 +315,11 @@ impl App {
         }
         if control {
             match key.code {
-                KeyCode::Char('d') => return self.show_diff().await,
-                KeyCode::Char('g') => {
-                    self.debug = !self.debug;
+                KeyCode::Char('o') => {
+                    self.copy_latest_response();
                     return Ok(());
                 }
+                KeyCode::Char('d') => return self.show_diff().await,
                 _ => {}
             }
         }
@@ -354,7 +342,7 @@ impl App {
             return Ok(());
         }
         if let InputEvent::Submitted(line) = self.input.input(key) {
-            self.dispatch(parse(&line)).await?;
+            self.dispatch(parse(&line), terminal).await?;
         }
         Ok(())
     }
@@ -364,50 +352,100 @@ impl App {
         match self.chat_task.take() {
             Some(task) => {
                 task.abort();
-                self.thinking_since = None;
                 self.chat_events = None;
+                self.activity = None;
+                self.streaming_cell = None;
+                self.streamed_response = false;
+                self.active_tool = None;
                 self.note(Level::Warn, "agent request cancelled");
             }
             None => self.should_quit = true,
         }
     }
 
-    async fn dispatch(&mut self, command: Command) -> Result<()> {
+    async fn dispatch(
+        &mut self,
+        command: Command,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<()> {
         match command {
             Command::Shell(command) if command.is_empty() => {}
-            Command::Shell(command) => match self.session.exec(command).await {
-                Ok(output) => self.transcript.push(CommandCell::new(
-                    output.command,
-                    output.output,
-                    output.exit_code,
-                )),
-                Err(error) => self.note(Level::Error, format!("{error:#}")),
-            },
-            Command::Chat(prompt) => self.start_chat(prompt),
-            Command::Acquire => match self.session.acquire().await {
-                Ok(id) => self.note(Level::Success, format!("attached {id}")),
-                Err(error) => self.note(Level::Error, format!("{error:#}")),
-            },
-            Command::Detach => match self.session.detach() {
-                Ok(entry) => self.note(
-                    Level::Info,
-                    format!("detached {entry}; the lease stays claimed"),
-                ),
-                Err(error) => self.note(Level::Error, format!("{error:#}")),
-            },
-            Command::Release => match self.session.release().await {
-                Ok(Some(snapshot)) => {
-                    self.note(Level::Success, format!("released; checkpoint {snapshot}"))
+            Command::Shell(command) => {
+                self.begin_activity("Running command", terminal)?;
+                let activity = self.activity.as_ref();
+                let theme = &self.theme;
+                let base = self
+                    .last_frame
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing rendered terminal frame"))?;
+                let result = await_with_activity(
+                    terminal,
+                    activity,
+                    theme,
+                    base,
+                    self.session.exec(command),
+                )
+                .await;
+                self.activity = None;
+                match result {
+                    Ok(output) => self.transcript.push(CommandCell::new(
+                        output.command,
+                        output.output,
+                        output.exit_code,
+                    )),
+                    Err(error) => self.note(Level::Error, format!("{error:#}")),
                 }
-                Ok(None) => self.note(Level::Success, "released; no changes to checkpoint"),
-                Err(error) => self.note(Level::Error, format!("{error:#}")),
-            },
+            }
+            Command::Chat(prompt) => self.start_chat(prompt),
+            Command::Connect(number) => {
+                let pending = self.session.prepare_connect(number)?;
+                self.begin_activity("Connecting to snapshot", terminal)?;
+                let activity = self.activity.as_ref();
+                let theme = &self.theme;
+                let base = self
+                    .last_frame
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing rendered terminal frame"))?;
+                let result = await_with_activity(terminal, activity, theme, base, async move {
+                    tokio::spawn(pending.run()).await.map_err(|error| {
+                        anyhow::anyhow!("snapshot connection task failed: {error}")
+                    })?
+                })
+                .await;
+                self.activity = None;
+                match result {
+                    Ok(connected) => match self.session.finish_connect(connected).await {
+                        Ok(message) => self.note(Level::Success, message),
+                        Err(error) => self.note(Level::Error, format!("{error:#}")),
+                    },
+                    Err(error) => self.note(Level::Error, format!("{error:#}")),
+                }
+            }
+            Command::Disconnect => {
+                self.begin_activity("Checkpointing snapshot", terminal)?;
+                let activity = self.activity.as_ref();
+                let theme = &self.theme;
+                let base = self
+                    .last_frame
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing rendered terminal frame"))?;
+                let result =
+                    await_with_activity(terminal, activity, theme, base, self.session.disconnect())
+                        .await;
+                self.activity = None;
+                match result {
+                    Ok(Some(snapshot)) => self.note(
+                        Level::Success,
+                        format!("disconnected; checkpoint {snapshot}"),
+                    ),
+                    Ok(None) => self.note(Level::Success, "disconnected; no changes to checkpoint"),
+                    Err(error) => self.note(Level::Error, format!("{error:#}")),
+                }
+            }
             Command::Diff => self.show_diff().await?,
-            Command::Restore(number) => match self.session.restore(number).await {
-                Ok(message) => self.note(Level::Success, message),
-                Err(error) => self.note(Level::Error, format!("{error:#}")),
-            },
-            Command::Debug => self.debug = !self.debug,
+            Command::Snapshots => self.overlay = Some(Overlay::Snapshots),
+            Command::Copy => self.copy_latest_response(),
+            Command::ToggleRaw => self.toggle_selection_mode(),
             Command::Clear => self.transcript.clear(),
             Command::Help => self.overlay = Some(Overlay::Help),
             Command::Quit => self.should_quit = true,
@@ -444,18 +482,19 @@ impl App {
             return;
         }
         let Some(active) = self.session.active() else {
-            self.note(Level::Error, "attach a sandbox before chatting (/acquire)");
+            self.note(Level::Error, "connect a snapshot before chatting (/c)");
             return;
         };
         let agent = self.agent.clone();
         let lease = active.lease.clone();
         let sandbox = Arc::clone(&active.sandbox);
         let (events, receiver) = mpsc::unbounded_channel();
-        self.transcript
-            .push(NoteCell::new(Level::Info, format!("you: {prompt}")));
-        self.thinking_since = Some(Instant::now());
+        self.transcript.push(UserCell::new(prompt.clone()));
+        self.activity = Some(Activity::new("Thinking"));
         self.chat_events = Some(receiver);
-        self.streaming.clear();
+        self.streaming_cell = None;
+        self.streamed_response = false;
+        self.active_tool = None;
         self.chat_task = Some(tokio::spawn(async move {
             agent
                 .run_on_lease_streaming(&lease, sandbox.as_ref(), &prompt, events)
@@ -465,24 +504,38 @@ impl App {
 
     fn on_chat_event(&mut self, event: CodingAgentEvent) {
         match event {
-            CodingAgentEvent::TextChunk(text) => self.streaming.push_str(&text),
+            CodingAgentEvent::TextChunk(text) => {
+                let streaming = match &self.streaming_cell {
+                    Some(streaming) => Rc::clone(streaming),
+                    None => {
+                        let streaming = Rc::new(RefCell::new(String::new()));
+                        self.transcript
+                            .push(StreamingCell::new(Rc::clone(&streaming)));
+                        self.streaming_cell = Some(Rc::clone(&streaming));
+                        streaming
+                    }
+                };
+                streaming.borrow_mut().push_str(&text);
+                self.streamed_response = true;
+                self.transcript.invalidate();
+            }
             CodingAgentEvent::ToolCall { name } => {
-                self.flush_streaming();
-                self.note(Level::Muted, format!("tool {name}"));
+                self.streaming_cell = None;
+                let state = Rc::new(RefCell::new(ToolState::running(name)));
+                self.transcript.push(ToolCell::new(Rc::clone(&state)));
+                self.active_tool = Some(state);
                 self.session.mark_dirty();
             }
             CodingAgentEvent::ToolResult { name, output } => {
-                self.transcript
-                    .push(CommandCell::new(name, output, Some(0)));
+                if let Some(tool) = self.active_tool.take() {
+                    tool.borrow_mut().complete(output);
+                    self.transcript.invalidate();
+                } else {
+                    let state = Rc::new(RefCell::new(ToolState::running(name)));
+                    state.borrow_mut().complete(output);
+                    self.transcript.push(ToolCell::new(state));
+                }
             }
-        }
-    }
-
-    fn flush_streaming(&mut self) {
-        let text = std::mem::take(&mut self.streaming);
-        if !text.trim().is_empty() {
-            self.transcript
-                .push(NoteCell::new(Level::Success, text.trim_end().to_string()));
         }
     }
 
@@ -493,26 +546,35 @@ impl App {
         let Some(result) = result else {
             return;
         };
+        self.chat_task = None;
         self.drain_chat_events();
-        self.thinking_since = None;
+        let streamed = self.streamed_response;
+        let streamed_text = self
+            .streaming_cell
+            .as_ref()
+            .map(|text| text.borrow().clone());
+        self.activity = None;
         self.chat_events = None;
+        self.streaming_cell = None;
+        self.streamed_response = false;
+        self.active_tool = None;
         match result {
             Ok(Ok(result)) => {
-                let streamed = !self.streaming.trim().is_empty();
-                self.flush_streaming();
+                let response = if streamed {
+                    streamed_text.unwrap_or_default()
+                } else {
+                    result.response.clone()
+                };
+                if !response.trim().is_empty() {
+                    self.latest_response = Some(response);
+                }
                 if !streamed && !result.response.trim().is_empty() {
-                    self.transcript.push(NoteCell::new(
-                        Level::Success,
-                        result.response.trim_end().to_string(),
-                    ));
+                    self.transcript
+                        .push(AssistantCell::new(result.response.trim_end()));
                 }
                 if !result.tools.is_empty() {
                     self.session.mark_dirty();
                 }
-                self.note(
-                    Level::Muted,
-                    format!("agent completed in {} round(s)", result.rounds),
-                );
             }
             Ok(Err(error)) => self.note(Level::Error, format!("agent failed: {error:#}")),
             Err(error) => self.note(Level::Error, format!("agent task failed: {error}")),
@@ -536,12 +598,61 @@ impl App {
         self.transcript.push(NoteCell::new(level, text));
     }
 
+    fn copy_latest_response(&mut self) {
+        let Some(response) = self.latest_response.as_deref() else {
+            self.note(Level::Warn, "no agent response to copy yet");
+            return;
+        };
+        match clipboard::copy(response) {
+            Ok(()) => self.note(Level::Success, "copied latest agent response"),
+            Err(error) => self.note(Level::Error, format!("copy failed: {error:#}")),
+        }
+    }
+
+    fn toggle_selection_mode(&mut self) {
+        let result = if self.mouse_capture {
+            crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+        } else {
+            crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+        };
+        match result {
+            Ok(()) => {
+                self.mouse_capture = !self.mouse_capture;
+                if self.mouse_capture {
+                    self.note(
+                        Level::Info,
+                        "terminal selection mode off; mouse scrolling enabled",
+                    );
+                } else {
+                    self.note(
+                        Level::Info,
+                        "terminal selection mode on; drag to highlight and copy",
+                    );
+                }
+            }
+            Err(error) => self.note(
+                Level::Error,
+                format!("could not change selection mode: {error}"),
+            ),
+        }
+    }
+
+    fn begin_activity(
+        &mut self,
+        label: impl Into<String>,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<()> {
+        self.activity = Some(Activity::new(label));
+        self.redraw(terminal)?;
+        Ok(())
+    }
+
     /// Resolves only once a chat task finishes; pends forever otherwise so it
     /// can sit in `select!` without busy-looping.
     async fn next_chat_result(
         task: &mut Option<ChatTask>,
     ) -> Option<std::result::Result<Result<CodingResult>, tokio::task::JoinError>> {
-        let Some(task) = task.take() else {
+        let Some(task) = task.as_mut() else {
             return std::future::pending().await;
         };
         Some(task.await)
@@ -550,17 +661,67 @@ impl App {
     async fn next_chat_event(
         receiver: &mut Option<UnboundedReceiver<CodingAgentEvent>>,
     ) -> Option<CodingAgentEvent> {
-        let Some(mut current) = receiver.take() else {
+        let Some(receiver) = receiver.as_mut() else {
             return std::future::pending().await;
         };
-        match current.recv().await {
-            Some(event) => {
-                *receiver = Some(current);
-                Some(event)
-            }
-            None => std::future::pending().await,
+        receiver.recv().await
+    }
+}
+
+async fn await_with_activity<T, F>(
+    terminal: &mut ratatui::DefaultTerminal,
+    activity: Option<&Activity>,
+    theme: &Theme,
+    base: Buffer,
+    operation: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::pin!(operation);
+    let mut tick = tokio::time::interval(Duration::from_millis(16));
+    let started = Instant::now();
+    let mut completed = None;
+    loop {
+        if completed.is_some() && started.elapsed() >= Duration::from_secs(1) {
+            return completed.expect("completed activity operation");
+        }
+        tokio::select! {
+            result = &mut operation, if completed.is_none() => completed = Some(result),
+            _ = tick.tick() => {
+                terminal.draw(|frame| {
+                    *frame.buffer_mut() = base.clone();
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(8),
+                            Constraint::Length(1),
+                            Constraint::Length(3),
+                            Constraint::Length(1),
+                        ])
+                    .split(content_area(frame.area()));
+                    if let Some(activity) = activity {
+                        activity.render(
+                            rows[1],
+                            frame.buffer_mut(),
+                            RenderCtx::new(theme),
+                        );
+                    }
+                })?;
+            },
         }
     }
+}
+
+fn content_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(HORIZONTAL_PADDING),
+        area.y.saturating_add(TOP_PADDING),
+        area.width
+            .saturating_sub(HORIZONTAL_PADDING.saturating_mul(2)),
+        area.height
+            .saturating_sub(TOP_PADDING.saturating_add(BOTTOM_PADDING)),
+    )
 }
 
 /// Static list of slash commands shown by `/help`.

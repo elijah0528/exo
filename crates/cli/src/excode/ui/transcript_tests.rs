@@ -40,11 +40,7 @@ fn tail_is_visible_by_default() {
     let mut transcript = Transcript::new();
     transcript.push(Fixed(vec!["one", "two", "three", "four"]));
     let rendered = render(&transcript, &theme, Rect::new(0, 0, 10, 2));
-    // The last column is the scrollbar: four lines do not fit in two rows.
-    assert_eq!(
-        rendered,
-        vec!["three    │".to_string(), "four     █".to_string()]
-    );
+    assert_eq!(rendered, vec!["three".to_string(), "four".to_string()]);
     assert!(transcript.is_following_tail());
 }
 
@@ -60,9 +56,10 @@ fn scrolling_up_unpins_and_end_repins() {
         crossterm::event::KeyCode::Up,
     ));
     assert!(!transcript.is_following_tail());
+    transcript.tick();
     assert_eq!(
         render(&transcript, &theme, area),
-        vec!["two      │".to_string(), "three    █".to_string()]
+        vec!["two".to_string(), "three".to_string()]
     );
 
     transcript.handle_key(crossterm::event::KeyEvent::from(
@@ -71,7 +68,7 @@ fn scrolling_up_unpins_and_end_repins() {
     assert!(transcript.is_following_tail());
     assert_eq!(
         render(&transcript, &theme, area),
-        vec!["three    │".to_string(), "four     █".to_string()]
+        vec!["three".to_string(), "four".to_string()]
     );
 }
 
@@ -82,7 +79,7 @@ fn new_cells_extend_the_layout() {
     transcript.push(Fixed(vec!["one"]));
     assert_eq!(transcript.line_count(20, &theme), 1);
     transcript.push(Fixed(vec!["two", "three"]));
-    assert_eq!(transcript.line_count(20, &theme), 3);
+    assert_eq!(transcript.line_count(20, &theme), 4);
     transcript.clear();
     assert_eq!(transcript.line_count(20, &theme), 0);
 }

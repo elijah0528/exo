@@ -15,6 +15,7 @@
 // crate, so parts of the surface have no in-tree caller yet.
 #![allow(dead_code)]
 
+pub mod activity;
 pub mod cells;
 pub mod component;
 pub mod diff;

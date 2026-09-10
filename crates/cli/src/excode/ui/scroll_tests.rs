@@ -6,6 +6,9 @@ fn follows_the_tail_until_the_user_scrolls_up() {
     assert_eq!(scroll.top(100, 10), 90);
 
     scroll.scroll_by(-5, 100, 10);
+    for _ in 0..5 {
+        scroll.tick(100, 10);
+    }
     assert_eq!(scroll.top(100, 10), 85);
     assert!(!scroll.is_pinned_to_bottom());
 
@@ -27,8 +30,14 @@ fn scrolling_back_to_the_end_re_pins() {
 fn clamps_at_both_ends() {
     let mut scroll = Scroll::default();
     scroll.scroll_by(-1000, 30, 10);
+    for _ in 0..20 {
+        scroll.tick(30, 10);
+    }
     assert_eq!(scroll.top(30, 10), 0);
     scroll.scroll_by(1000, 30, 10);
+    for _ in 0..20 {
+        scroll.tick(30, 10);
+    }
     assert_eq!(scroll.top(30, 10), 20);
 }
 

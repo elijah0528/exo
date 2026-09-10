@@ -8,6 +8,11 @@ use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
+    pub user_background: Style,
+    pub user_text: Style,
+    pub user_prompt: Style,
+    pub assistant_background: Style,
+    pub tool_background: Style,
     pub text: Style,
     pub dim: Style,
     pub title: Style,
@@ -34,31 +39,34 @@ impl Theme {
     /// keeps ownership of the actual hues.
     pub fn dark() -> Self {
         Self {
+            user_background: Style::default().bg(Color::Rgb(104, 58, 58)),
+            user_text: Style::default().fg(Color::Rgb(255, 224, 224)),
+            user_prompt: Style::default()
+                .fg(Color::Rgb(255, 180, 180))
+                .add_modifier(Modifier::BOLD),
+            assistant_background: Style::default(),
+            tool_background: Style::default().bg(Color::Rgb(28, 0, 0)),
             text: Style::default(),
             dim: Style::default().add_modifier(Modifier::DIM),
             title: Style::default().add_modifier(Modifier::BOLD),
-            accent: Style::default().fg(Color::Cyan),
+            accent: Style::default().fg(Color::Red),
             border: Style::default().add_modifier(Modifier::DIM),
-            border_focused: Style::default().fg(Color::Cyan),
+            border_focused: Style::default().fg(Color::Red),
             selection: Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(Color::Red)
                 .add_modifier(Modifier::BOLD),
-            success: Style::default().fg(Color::Green),
-            warn: Style::default().fg(Color::Yellow),
+            success: Style::default().fg(Color::Red),
+            warn: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             error: Style::default().fg(Color::Red),
-            info: Style::default().fg(Color::Blue),
-            key: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            prompt: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            added: Style::default().fg(Color::Green),
-            removed: Style::default().fg(Color::Red),
-            hunk: Style::default().fg(Color::Magenta),
+            info: Style::default().fg(Color::Red),
+            key: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            prompt: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            added: Style::default().fg(Color::Red),
+            removed: Style::default().fg(Color::Rgb(128, 0, 0)),
+            hunk: Style::default().fg(Color::Red),
             line_number: Style::default().add_modifier(Modifier::DIM),
-            gauge_filled: Style::default().fg(Color::Cyan),
+            gauge_filled: Style::default().fg(Color::Red),
             gauge_empty: Style::default().add_modifier(Modifier::DIM),
         }
     }
@@ -69,6 +77,11 @@ impl Theme {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let bold = Style::default().add_modifier(Modifier::BOLD);
         Self {
+            user_background: plain,
+            user_text: plain,
+            user_prompt: bold,
+            assistant_background: plain,
+            tool_background: plain,
             text: plain,
             dim,
             title: bold,

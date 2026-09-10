@@ -5,14 +5,10 @@
 //! every call: the scroll state never caches them, so a component can re-wrap,
 //! filter, or resize without invalidating anything.
 
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-
-use super::theme::Theme;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scroll {
     top: usize,
+    target: usize,
     /// While pinned, the viewport follows the end of the content.
     pinned_to_bottom: bool,
 }
@@ -21,6 +17,7 @@ impl Default for Scroll {
     fn default() -> Self {
         Self {
             top: 0,
+            target: 0,
             pinned_to_bottom: true,
         }
     }
@@ -44,10 +41,35 @@ impl Scroll {
     /// Scroll by `delta` rows; negative scrolls towards the top.
     pub fn scroll_by(&mut self, delta: isize, total: usize, viewport: usize) {
         let max = max_top(total, viewport);
-        let current = self.top(total, viewport) as isize;
+        let current = if self.pinned_to_bottom {
+            max
+        } else {
+            self.target.min(max)
+        } as isize;
         let next = current.saturating_add(delta).clamp(0, max as isize) as usize;
-        self.top = next;
+        self.target = next;
+        if self.pinned_to_bottom && next < max {
+            self.top = max;
+        }
         self.pinned_to_bottom = next >= max;
+        if self.pinned_to_bottom {
+            self.top = max;
+        }
+    }
+
+    /// Advance one smooth scroll step toward the requested position.
+    pub fn tick(&mut self, total: usize, viewport: usize) {
+        if self.pinned_to_bottom {
+            self.top = max_top(total, viewport);
+            self.target = self.top;
+            return;
+        }
+        self.top = match self.top.cmp(&self.target) {
+            std::cmp::Ordering::Less => self.top + 1,
+            std::cmp::Ordering::Greater => self.top.saturating_sub(1),
+            std::cmp::Ordering::Equal => self.top,
+        };
+        self.top = self.top.min(max_top(total, viewport));
     }
 
     pub fn page_up(&mut self, total: usize, viewport: usize) {
@@ -60,6 +82,7 @@ impl Scroll {
 
     pub fn scroll_to_top(&mut self) {
         self.top = 0;
+        self.target = 0;
         self.pinned_to_bottom = false;
     }
 
@@ -70,44 +93,6 @@ impl Scroll {
 
 fn max_top(total: usize, viewport: usize) -> usize {
     total.saturating_sub(viewport)
-}
-
-/// Draw a one-column scrollbar on the right edge of `area`.
-///
-/// Nothing is drawn when everything fits, so callers can render it
-/// unconditionally.
-pub fn render_scrollbar(
-    area: Rect,
-    buf: &mut Buffer,
-    theme: &Theme,
-    total: usize,
-    top: usize,
-) -> bool {
-    let viewport = usize::from(area.height);
-    if area.width == 0 || viewport == 0 || total <= viewport {
-        return false;
-    }
-    let thumb_height = ((viewport * viewport) / total).max(1);
-    let scrollable = total - viewport;
-    let travel = viewport - thumb_height;
-    let thumb_top = if scrollable == 0 {
-        0
-    } else {
-        (top * travel).div_ceil(scrollable)
-    };
-    let x = area.x + area.width - 1;
-    for row in 0..viewport {
-        let inside = row >= thumb_top && row < thumb_top + thumb_height;
-        let (symbol, style) = if inside {
-            ("█", theme.accent)
-        } else {
-            ("│", theme.gauge_empty)
-        };
-        buf[(x, area.y + row as u16)]
-            .set_symbol(symbol)
-            .set_style(style);
-    }
-    true
 }
 
 #[cfg(test)]

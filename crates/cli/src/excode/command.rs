@@ -10,14 +10,13 @@ pub enum Command {
     Shell(String),
     /// Send a prompt to the coding agent.
     Chat(String),
-    Acquire,
-    Detach,
-    Release,
+    Connect(Option<usize>),
+    Disconnect,
     /// Show `git diff` from the attached sandbox.
     Diff,
-    /// Restore a snapshot by its 1-based number, or the selected one.
-    Restore(Option<usize>),
-    Debug,
+    Snapshots,
+    Copy,
+    ToggleRaw,
     Clear,
     Help,
     Quit,
@@ -28,25 +27,32 @@ pub enum Command {
 
 /// Everything `/help` lists, and the source of truth for dispatch.
 pub const COMMANDS: &[(&str, &str)] = &[
-    ("/chat <message>", "ask the coding agent"),
-    ("/run <command>", "run a shell command in the sandbox"),
-    ("/acquire", "lease a warm sandbox"),
-    ("/detach", "keep the lease but stop using it"),
-    ("/release", "release the lease and checkpoint"),
+    ("/c [#]", "connect to a snapshot"),
+    ("/dc", "disconnect and checkpoint the current snapshot"),
+    ("<message>", "send a prompt to the coding agent"),
+    (
+        "/chat <message>",
+        "send a prompt to the coding agent (alias)",
+    ),
+    ("/cmd <command>", "run a shell command in the sandbox"),
     ("/diff", "show git diff from the sandbox"),
-    ("/restore [#]", "restore a snapshot"),
-    ("/debug", "toggle the sandbox utilization panel"),
+    ("/snapshots", "show available snapshots"),
+    ("/copy", "copy the latest agent response"),
+    ("/raw", "toggle terminal selection mode"),
     ("/clear", "clear the transcript"),
     ("/help", "list commands"),
     ("/quit", "exit"),
 ];
 
-/// Parse a submitted line. Anything without a leading `/` is a shell command,
-/// which keeps the common case one keystroke shorter.
+/// Parse a submitted line. Anything without a leading `/` is a prompt for the
+/// coding agent, which keeps the common case one keystroke shorter.
 pub fn parse(line: &str) -> Command {
     let line = line.trim();
+    if line.is_empty() {
+        return Command::Shell(String::new());
+    }
     let Some(rest) = line.strip_prefix('/') else {
-        return Command::Shell(line.to_string());
+        return Command::Chat(line.to_string());
     };
     let (name, argument) = match rest.split_once(char::is_whitespace) {
         Some((name, argument)) => (name, argument.trim()),
@@ -55,18 +61,18 @@ pub fn parse(line: &str) -> Command {
     match name {
         "chat" if argument.is_empty() => Command::MissingArgument("/chat <message>"),
         "chat" => Command::Chat(argument.to_string()),
-        "run" if argument.is_empty() => Command::MissingArgument("/run <command>"),
-        "run" => Command::Shell(argument.to_string()),
-        "acquire" => Command::Acquire,
-        "detach" => Command::Detach,
-        "release" => Command::Release,
-        "diff" => Command::Diff,
-        "restore" if argument.is_empty() => Command::Restore(None),
-        "restore" => match argument.parse::<usize>() {
-            Ok(number) => Command::Restore(Some(number)),
-            Err(_) => Command::MissingArgument("/restore [#]"),
+        "cmd" if argument.is_empty() => Command::MissingArgument("/cmd <command>"),
+        "cmd" => Command::Shell(argument.to_string()),
+        "c" if argument.is_empty() => Command::Connect(None),
+        "c" => match argument.parse::<usize>() {
+            Ok(number) => Command::Connect(Some(number)),
+            Err(_) => Command::MissingArgument("/c [#]"),
         },
-        "debug" => Command::Debug,
+        "diff" => Command::Diff,
+        "snapshots" | "snapshot" | "s" => Command::Snapshots,
+        "copy" => Command::Copy,
+        "raw" => Command::ToggleRaw,
+        "dc" => Command::Disconnect,
         "clear" => Command::Clear,
         "help" => Command::Help,
         "quit" | "exit" => Command::Quit,

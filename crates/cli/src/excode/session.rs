@@ -4,7 +4,6 @@
 //! snapshot store, and returns plain data. The app layer turns that data into
 //! transcript cells, which keeps pool behavior testable and the views dumb.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,12 +11,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use excode::{
     EmptySandboxPoolProvisioner, LocalSandboxPool, LocalSandboxPoolStore, ManagedSandboxLease,
-    PoolCapacity, PoolEntryState, SandboxPoolEntryView, SandboxPoolKey, SandboxPoolSnapshotStore,
-    SandboxPoolSnapshotView, SnapshotRetentionPolicy,
+    PoolCapacity, SandboxPoolKey, SandboxPoolSnapshotStore, SandboxPoolSnapshotView,
+    SnapshotRetentionPolicy,
 };
 use exoharness::{
     CliContainerSandboxBackend, LocalProcessSandboxBackend, ManagedSandboxBackend, SandboxCommand,
-    SandboxNetworkPolicy, SandboxSpec, SnapshotId,
+    SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxSpec, SnapshotId,
 };
 
 use super::args::PoolBackend;
@@ -25,6 +24,7 @@ use super::args::PoolBackend;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SNAPSHOTS: usize = 20;
 const MAX_SNAPSHOT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const RECIPE_WORKDIR: &str = "/workspace/exo";
 
 /// Outcome of running a command inside the sandbox.
 #[derive(Debug, Clone)]
@@ -34,39 +34,67 @@ pub struct ExecOutput {
     pub exit_code: Option<i32>,
 }
 
-/// A single row of the sandbox table, already flattened for rendering.
-#[derive(Debug, Clone)]
-pub struct EntryRow {
-    pub index: usize,
-    pub sandbox_id: String,
-    pub state: PoolEntryState,
-    pub dirty: bool,
-    pub owner: Option<String>,
-    pub idle_secs: u64,
-    pub snapshot: Option<String>,
+/// An owned snapshot connection operation that can run independently of the
+/// UI task while a progress surface remains interactive.
+pub struct PendingConnect {
+    pool: Arc<LocalSandboxPool>,
+    target: ConnectTarget,
 }
 
-/// How much of the pool is in use right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Utilization {
-    pub ready: usize,
-    pub leased: usize,
-    pub starting: usize,
-    pub retiring: usize,
-    pub total: usize,
-    pub warm_size: usize,
-    pub max_total: usize,
+enum ConnectTarget {
+    Baseline,
+    Snapshot {
+        owner_id: String,
+        snapshot_id: SnapshotId,
+        selected: usize,
+    },
+}
+
+pub struct ConnectedLease {
+    pub lease: ManagedSandboxLease,
+    message: String,
+    selected: Option<usize>,
+}
+
+impl PendingConnect {
+    pub async fn run(self) -> Result<ConnectedLease> {
+        let (lease, message, selected) = match self.target {
+            ConnectTarget::Baseline => {
+                let lease = self.pool.acquire_any("cli").await?;
+                let id = lease.sandbox.id().to_string();
+                (lease, format!("connected to recipe baseline on {id}"), None)
+            }
+            ConnectTarget::Snapshot {
+                owner_id,
+                snapshot_id,
+                selected,
+            } => {
+                let lease = self
+                    .pool
+                    .acquire_any_from_snapshot(owner_id, snapshot_id)
+                    .await?;
+                (
+                    lease,
+                    format!("connected to snapshot {snapshot_id}"),
+                    Some(selected),
+                )
+            }
+        };
+        Ok(ConnectedLease {
+            lease,
+            message,
+            selected,
+        })
+    }
 }
 
 pub struct Session {
     pool: Arc<LocalSandboxPool>,
     pool_id: String,
     snapshot_store: Option<Arc<dyn SandboxPoolSnapshotStore>>,
-    entries: Vec<SandboxPoolEntryView>,
     snapshots: Vec<SandboxPoolSnapshotView>,
     snapshot_selected: usize,
     active: Option<ManagedSandboxLease>,
-    detached: HashMap<String, ManagedSandboxLease>,
     dirty: bool,
 }
 
@@ -85,17 +113,29 @@ impl Session {
         if max_total < warm_size {
             bail!("--max-workers must be at least --workers");
         }
-        let (managed, default_workdir): (Arc<dyn ManagedSandboxBackend>, String) = match backend {
+        let (managed, default_workdir, mounts): (
+            Arc<dyn ManagedSandboxBackend>,
+            String,
+            Vec<SandboxMount>,
+        ) = match backend {
             PoolBackend::LocalProcess => (
                 Arc::new(LocalProcessSandboxBackend::new()),
                 std::env::current_dir()
                     .context("determining the local sandbox working directory")?
                     .to_string_lossy()
                     .into_owned(),
+                Vec::new(),
             ),
             PoolBackend::Docker => (
                 Arc::new(CliContainerSandboxBackend::docker()),
-                "/".to_string(),
+                RECIPE_WORKDIR.to_string(),
+                vec![SandboxMount {
+                    host_path: std::env::current_dir()
+                        .context("determining the Docker workspace mount")?,
+                    guest_path: RECIPE_WORKDIR.to_string(),
+                    access: SandboxMountAccess::ReadWrite,
+                    internal: false,
+                }],
             ),
         };
         // Only container backends can checkpoint a filesystem, so the local
@@ -111,7 +151,6 @@ impl Session {
                         ..Default::default()
                     },
                 ));
-                store.clear().await?;
                 Some(store)
             }
         };
@@ -126,7 +165,7 @@ impl Session {
                 spec: SandboxSpec {
                     image,
                     resources: Default::default(),
-                    mounts: Vec::new(),
+                    mounts,
                     durable_file_systems: Vec::new(),
                     network: SandboxNetworkPolicy::Enabled,
                     default_workdir,
@@ -149,11 +188,9 @@ impl Session {
             pool,
             pool_id: pool_id.to_string(),
             snapshot_store,
-            entries: Vec::new(),
             snapshots: Vec::new(),
             snapshot_selected: 0,
             active: None,
-            detached: HashMap::new(),
             dirty: false,
         })
     }
@@ -182,13 +219,8 @@ impl Session {
         &self.snapshots
     }
 
-    pub fn detached_count(&self) -> usize {
-        self.detached.len()
-    }
-
     /// Re-read pool entries and snapshots. Called on a timer by the app loop.
     pub async fn refresh(&mut self) -> Result<()> {
-        self.entries = self.pool.entries().await;
         let Some(store) = &self.snapshot_store else {
             self.snapshots.clear();
             self.snapshot_selected = 0;
@@ -206,82 +238,52 @@ impl Session {
         Ok(())
     }
 
-    pub fn utilization(&self) -> Utilization {
-        let count = |state: PoolEntryState| {
-            self.entries
-                .iter()
-                .filter(|entry| entry.state == state)
-                .count()
-        };
-        let capacity = self.pool.capacity();
-        let ready = count(PoolEntryState::Ready);
-        let leased = count(PoolEntryState::Leased);
-        let retiring = count(PoolEntryState::Retiring);
-        Utilization {
-            ready,
-            leased,
-            retiring,
-            starting: self.entries.len() - ready - leased - retiring,
-            total: self.entries.len(),
-            warm_size: capacity.warm_size,
-            max_total: capacity.max_total,
-        }
-    }
-
-    pub fn rows(&self) -> Vec<EntryRow> {
-        self.entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| EntryRow {
-                index: index + 1,
-                sandbox_id: entry
-                    .sandbox_id
-                    .as_deref()
-                    .map(short_id)
-                    .unwrap_or_else(|| "starting".to_string()),
-                state: entry.state,
-                dirty: entry.dirty,
-                owner: entry.lease_owner.clone(),
-                idle_secs: entry.idle_for.as_secs(),
-                snapshot: entry.snapshot_id.map(|id| self.snapshot_label(id)),
-            })
-            .collect()
-    }
-
-    fn snapshot_label(&self, snapshot_id: SnapshotId) -> String {
-        self.snapshots
-            .iter()
-            .position(|snapshot| snapshot.snapshot_id == snapshot_id)
-            .map(|index| (index + 1).to_string())
-            .unwrap_or_else(|| short_id(&snapshot_id.to_string()))
-    }
-
-    /// Lease any warm sandbox. Returns the sandbox id that was attached.
-    pub async fn acquire(&mut self) -> Result<String> {
+    /// Connect to a snapshot, creating the recipe baseline on first use.
+    pub fn prepare_connect(&self, number: Option<usize>) -> Result<PendingConnect> {
         if self.active.is_some() {
-            bail!("detach the active sandbox before acquiring another");
+            bail!("disconnect from the current snapshot before connecting to another");
         }
-        let lease = self.pool.acquire_any("cli".to_string()).await?;
-        let id = lease.sandbox.id().to_string();
+        if self.snapshot_store.is_none() || self.snapshots.is_empty() {
+            return Ok(PendingConnect {
+                pool: Arc::clone(&self.pool),
+                target: ConnectTarget::Baseline,
+            });
+        }
+
+        let index = number.unwrap_or(self.snapshot_selected + 1);
+        if index == 0 || index > self.snapshots.len() {
+            bail!(
+                "snapshot {index} does not exist; choose 1-{}",
+                self.snapshots.len()
+            );
+        }
+        let selected = index - 1;
+        let snapshot = &self.snapshots[selected];
+        let snapshot_id = snapshot.snapshot_id;
+        let owner_id = snapshot.owner_id.clone();
+        Ok(PendingConnect {
+            pool: Arc::clone(&self.pool),
+            target: ConnectTarget::Snapshot {
+                owner_id,
+                snapshot_id,
+                selected,
+            },
+        })
+    }
+
+    pub async fn finish_connect(&mut self, connected: ConnectedLease) -> Result<String> {
+        if let Some(selected) = connected.selected {
+            self.snapshot_selected = selected;
+        }
+        let message = connected.message;
+        self.active = Some(connected.lease);
         self.dirty = false;
-        self.active = Some(lease);
         self.refresh().await?;
-        Ok(id)
+        Ok(message)
     }
 
-    /// Stop using the lease without releasing it; it keeps being heartbeated.
-    pub fn detach(&mut self) -> Result<String> {
-        let Some(lease) = self.active.take() else {
-            bail!("no sandbox is attached");
-        };
-        let entry_id = lease.lease.entry_id.clone();
-        self.dirty = false;
-        self.detached.insert(entry_id.clone(), lease);
-        Ok(entry_id)
-    }
-
-    /// Release the lease, checkpointing the filesystem when supported.
-    pub async fn release(&mut self) -> Result<Option<SnapshotId>> {
+    /// Disconnect from the current snapshot, checkpointing changes when supported.
+    pub async fn disconnect(&mut self) -> Result<Option<SnapshotId>> {
         let Some(active) = self.active.take() else {
             bail!("no sandbox is attached");
         };
@@ -294,40 +296,10 @@ impl Session {
         Ok(checkpoint)
     }
 
-    /// Attach a sandbox restored from snapshot `number` (1-based).
-    pub async fn restore(&mut self, number: Option<usize>) -> Result<String> {
-        if self.active.is_some() {
-            bail!("release the active sandbox before restoring a snapshot");
-        }
-        if self.snapshot_store.is_none() {
-            let id = self.acquire().await?;
-            return Ok(format!("recipe baseline restored on {id}"));
-        }
-        let index = number.unwrap_or(self.snapshot_selected + 1);
-        if index == 0 || index > self.snapshots.len() {
-            bail!(
-                "snapshot {index} does not exist; choose 1-{}",
-                self.snapshots.len()
-            );
-        }
-        self.snapshot_selected = index - 1;
-        let snapshot = &self.snapshots[self.snapshot_selected];
-        let snapshot_id = snapshot.snapshot_id;
-        let owner_id = snapshot.owner_id.clone();
-        let lease = self
-            .pool
-            .acquire_any_from_snapshot(owner_id, snapshot_id)
-            .await?;
-        self.dirty = false;
-        self.active = Some(lease);
-        self.refresh().await?;
-        Ok(format!("restored snapshot {snapshot_id}"))
-    }
-
     /// Run `command` in the attached sandbox through a login shell.
     pub async fn exec(&mut self, command: String) -> Result<ExecOutput> {
         let Some(active) = &self.active else {
-            bail!("no sandbox is attached; run /acquire first");
+            bail!("no snapshot is connected; run /c first");
         };
         let result = active
             .sandbox
@@ -365,21 +337,17 @@ impl Session {
 
     /// Keep every lease we hold alive; dropped leases are forgotten.
     pub async fn heartbeat(&mut self) -> Vec<String> {
-        let mut leases = self
-            .detached
-            .values()
-            .map(|lease| lease.lease.clone())
-            .collect::<Vec<_>>();
-        if let Some(active) = &self.active {
-            leases.push(active.lease.clone());
-        }
+        let leases = self
+            .active
+            .as_ref()
+            .map(|lease| vec![lease.lease.clone()])
+            .unwrap_or_default();
         let mut failures = Vec::new();
         for lease in leases {
             let Err(error) = self.pool.heartbeat(&lease).await else {
                 continue;
             };
             failures.push(format!("lease heartbeat failed: {error:#}"));
-            self.detached.remove(&lease.entry_id);
             if self
                 .active
                 .as_ref()

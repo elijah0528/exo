@@ -10,7 +10,6 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use super::component::{Component, EventFlow, RenderCtx};
-use super::scroll::render_scrollbar;
 
 #[derive(Debug, Default)]
 pub struct SelectionList {
@@ -96,7 +95,6 @@ impl Component for SelectionList {
                 buf.set_style(Rect::new(area.x, y, area.width, 1), ctx.theme.selection);
             }
         }
-        render_scrollbar(area, buf, ctx.theme, self.rows.len(), top);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
