@@ -13,10 +13,14 @@ use tokio::sync::Mutex;
 
 use exoharness::{Result, SnapshotFormat, SnapshotId, SnapshotPayload, Uuid7};
 
+/// Snapshot metadata: id, format, content hash, size, and access timestamps.
+/// Read on every lookup, so it is kept separate from the payload.
 const MANIFEST_FILE: &str = "manifest.json";
+/// The snapshot bytes themselves, exactly as the provider produced them.
 const PAYLOAD_FILE: &str = "payload.bin";
-/// Directories that are still being written are hidden behind this prefix and
-/// published with a rename.
+/// Snapshot directories still being written are hidden behind this prefix and
+/// published with a rename, so a reader never sees a partial snapshot. Any
+/// directory left behind by an interrupted write is removed by `prune`.
 const TEMPORARY_PREFIX: &str = ".tmp-";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

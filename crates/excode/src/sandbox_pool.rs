@@ -218,10 +218,9 @@ pub struct LocalSandboxPool {
     backend: Arc<dyn ManagedSandboxBackend>,
     provisioner: Arc<dyn SandboxPoolProvisioner>,
     snapshot_store: Option<Arc<dyn SandboxPoolSnapshotStore>>,
-    /// Every entry of a pool is materialized from this one baseline snapshot,
-    /// so entries handed out by the pool are interchangeable. It is written
-    /// once when the first entry is created and re-written only when the
-    /// stored baseline turns out to be unusable.
+    /// All sandboxes in a pool share the same baseline snapshot, which is what
+    /// makes their entries interchangeable. It is written once when the first
+    /// entry is created and rewritten only when it turns out to be unusable.
     baseline_snapshot: RwLock<Option<SnapshotId>>,
     policy: PoolPolicy,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
@@ -904,23 +903,23 @@ impl LocalSandboxPool {
             if entry.state != PoolEntryState::Retiring {
                 return Ok(());
             }
-            let unsaved = entry.dirty.then(|| {
-                entry
-                    .lease
-                    .as_ref()
-                    .map(|lease| (lease.worker_id.clone(), entry.handle.clone()))
-            });
+            let unsaved = match (&entry.lease, &entry.handle) {
+                (Some(lease), Some(handle)) if entry.dirty => {
+                    Some((lease.worker_id.clone(), Arc::clone(handle)))
+                }
+                _ => None,
+            };
             (
                 entry.request.clone(),
                 entry.handle.is_some() || entry.request.provider_state.is_some(),
-                unsaved.flatten(),
+                unsaved,
             )
         };
 
         // An entry can be retired while its worker still has unsaved work, for
         // example when its lease expires. Keep that work reachable through the
         // snapshot store instead of destroying it with the runtime.
-        if let Some((owner_id, Some(handle))) = unsaved
+        if let Some((owner_id, handle)) = unsaved
             && let Err(error) = self.checkpoint(&owner_id, handle).await
         {
             tracing::warn!(%error, %entry_id, %owner_id, "failed checkpointing sandbox before retirement");
