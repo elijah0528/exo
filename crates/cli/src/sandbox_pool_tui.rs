@@ -305,7 +305,7 @@ impl PoolTui {
             "release" => self.release().await,
             "retire" => self.retire_selected().await,
             "dirty" => self.execute("touch temp.txt".to_string()).await,
-            command if command == "restore" => self.restore_snapshot().await,
+            "restore" => self.restore_snapshot().await,
             command if command.starts_with("restore ") => {
                 self.restore_snapshot_argument(command, "restore").await
             }
