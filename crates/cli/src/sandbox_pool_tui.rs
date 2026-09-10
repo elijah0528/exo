@@ -116,7 +116,9 @@ pub async fn run(root: &Path, args: SandboxPoolArgs) -> Result<()> {
     let result = PoolTui::new(pool.clone(), snapshot_store, pool_id.to_string())
         .run()
         .await;
-    let _ = shutdown.send(true);
+    if shutdown.send(true).is_err() {
+        tracing::warn!("sandbox pool reconciler stopped before shutdown");
+    }
     reconciler
         .await
         .context("sandbox pool reconciler task failed")?;
@@ -420,7 +422,7 @@ impl PoolTui {
             self.note("Claim the selected sandbox before retiring it");
             return Ok(());
         };
-        self.pool.reset(&lease.lease).await?;
+        self.pool.retire(&lease.lease).await?;
         self.dirty = false;
         self.note(format!("Retired {}", lease.sandbox.id()));
         self.refresh().await?;
@@ -571,7 +573,7 @@ impl PoolTui {
             self.note("No sandbox is connected");
             return Ok(());
         };
-        self.pool.reset(&active.lease).await?;
+        self.pool.retire(&active.lease).await?;
         self.note("Sandbox reset and removed from the pool");
         self.refresh().await?;
         Ok(())

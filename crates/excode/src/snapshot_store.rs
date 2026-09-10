@@ -350,7 +350,9 @@ async fn read_manifest(path: &Path) -> Result<SnapshotManifest> {
 }
 
 async fn write_manifest(path: &Path, manifest: &SnapshotManifest) -> Result<()> {
-    fs::write(path, serde_json::to_vec(manifest)?).await?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec(manifest)?).await?;
+    fs::rename(temporary, path).await?;
     Ok(())
 }
 
