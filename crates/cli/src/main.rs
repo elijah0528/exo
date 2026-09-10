@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use excode::CodingHarness;
 use executor::{
     AgentHandle, AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig,
     BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
@@ -296,6 +297,7 @@ impl FirecrackerArgs {
 enum HarnessKind {
     Basic,
     Rlm,
+    Coding,
     #[value(name = "typescript")]
     TypeScript,
     Exo,
@@ -355,6 +357,7 @@ impl FromStr for HarnessSelection {
         match raw {
             "basic" => Ok(Self::Kind(HarnessKind::Basic)),
             "rlm" => Ok(Self::Kind(HarnessKind::Rlm)),
+            "coding" => Ok(Self::Kind(HarnessKind::Coding)),
             "typescript" => Ok(Self::Kind(HarnessKind::TypeScript)),
             "exo" => Ok(Self::Kind(HarnessKind::Exo)),
             "codex" => Ok(Self::TypeScriptPreset(TypeScriptHarnessPreset::Codex)),
@@ -3141,6 +3144,11 @@ async fn instantiate_harness(
             runtime_config,
             env_vars,
         )),
+        HarnessKind::Coding => Arc::new(CodingHarness::from_exoharness(
+            exoharness,
+            runtime_config,
+            env_vars,
+        )),
         HarnessKind::Exo => Arc::new(
             TypeScriptHarness::<ExoToolRuntime>::exo_from_root(
                 root,
@@ -3163,6 +3171,7 @@ fn to_agent_harness_kind(kind: HarnessKind) -> AgentHarnessKind {
     match kind {
         HarnessKind::Basic => AgentHarnessKind::Basic,
         HarnessKind::Rlm => AgentHarnessKind::Rlm,
+        HarnessKind::Coding => AgentHarnessKind::Coding,
         HarnessKind::TypeScript => AgentHarnessKind::TypeScript,
         HarnessKind::Exo => AgentHarnessKind::Exo,
     }
@@ -3172,6 +3181,7 @@ fn from_agent_harness_kind(kind: AgentHarnessKind) -> HarnessKind {
     match kind {
         AgentHarnessKind::Basic => HarnessKind::Basic,
         AgentHarnessKind::Rlm => HarnessKind::Rlm,
+        AgentHarnessKind::Coding => HarnessKind::Coding,
         AgentHarnessKind::TypeScript => HarnessKind::TypeScript,
         AgentHarnessKind::Exo => HarnessKind::Exo,
     }
@@ -3181,6 +3191,7 @@ fn format_harness_kind(kind: AgentHarnessKind) -> &'static str {
     match kind {
         AgentHarnessKind::Basic => "basic",
         AgentHarnessKind::Rlm => "rlm",
+        AgentHarnessKind::Coding => "coding",
         AgentHarnessKind::TypeScript => "typescript",
         AgentHarnessKind::Exo => "exo",
     }
@@ -3324,6 +3335,7 @@ fn format_harness_selection(selection: &HarnessSelection) -> String {
         HarnessSelection::Kind(kind) => match kind {
             HarnessKind::Basic => "basic".to_string(),
             HarnessKind::Rlm => "rlm".to_string(),
+            HarnessKind::Coding => "coding".to_string(),
             HarnessKind::TypeScript => "typescript".to_string(),
             HarnessKind::Exo => "exo".to_string(),
         },

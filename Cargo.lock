@@ -2529,6 +2529,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "cost",
  "executor",
  "exoharness",
  "futures",

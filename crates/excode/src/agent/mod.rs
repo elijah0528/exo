@@ -3,11 +3,20 @@
 mod prompts;
 mod tools;
 
+pub mod coding_tools;
+pub mod context;
+pub mod executor;
+#[cfg(test)]
+mod executor_tests;
+pub mod harness;
+pub mod registry;
+pub mod runtime;
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::executor::{ModelClient, ModelRequest, ModelResponse, PendingToolCall};
 use anyhow::{Context, Result, bail};
-use executor::{ModelClient, ModelRequest, ModelResponse, PendingToolCall};
 use lingua::{
     Message,
     universal::{
@@ -20,7 +29,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{ManagedSandboxCapability, ManagedSandboxPool};
 
+pub use context::ContextProjection;
+pub use executor::CodingExecutor;
+pub use harness::CodingHarness;
 pub use prompts::SYSTEM_PROMPT;
+pub use registry::{ToolContext, ToolHandler, ToolRegistry};
+pub use runtime::CodingToolRuntime;
 pub use tools::coding_tool_definitions;
 
 #[derive(Debug, Clone)]
@@ -382,8 +396,8 @@ async fn run_list_files(
 mod tests {
     use std::sync::Mutex;
 
+    use ::executor::{ModelResponse, ModelResponseStream};
     use async_trait::async_trait;
-    use executor::{ModelResponse, ModelResponseStream};
     use exoharness::{SandboxCommand, SandboxCommandOutput, ToolRequest};
     use serde_json::Map;
 
@@ -506,7 +520,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn reset(&self, _lease: &SandboxLease) -> Result<()> {
+        async fn retire(&self, _lease: &SandboxLease) -> Result<()> {
             Ok(())
         }
 

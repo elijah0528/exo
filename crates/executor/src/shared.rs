@@ -167,7 +167,7 @@ pub(crate) async fn finalize_turn(turn: &dyn TurnHandle, result: Result<()>) -> 
     }
 }
 
-pub(crate) fn try_send_stream_event(
+pub fn try_send_stream_event(
     event_tx: &mpsc::UnboundedSender<Result<ExecutionStreamEvent>>,
     event: ExecutionStreamEvent,
 ) {

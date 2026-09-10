@@ -76,55 +76,65 @@ where
         conversation: &dyn ConversationHandle,
         instructions: &[Message],
     ) -> Result<Vec<Message>> {
-        let conversation_id = conversation.record().id;
-        let cached_entry = {
-            let cache = self.history_cache.read().expect(HISTORY_CACHE_NAME);
-            cache.get(&conversation_id).cloned()
-        };
-
-        let result = conversation
-            .get_events(Some(EventQuery {
-                cursor: cached_entry.as_ref().and_then(|entry| entry.cursor),
-                direction: Some(EventQueryDirection::Asc),
-                limit: None,
-                session_id: None,
-                turn_id: None,
-                types: Some(vec![
-                    EventKind::MESSAGES,
-                    EventKind::TOOL_REQUESTED,
-                    EventKind::TOOL_RESULT,
-                ]),
-            }))
-            .await?;
-
-        let mut event_messages = cached_entry
-            .as_ref()
-            .map_or_else(Vec::new, |entry| entry.messages.clone());
-        let mut tool_call_names = cached_entry
-            .as_ref()
-            .map_or_else(HashMap::new, |entry| entry.tool_call_names.clone());
-        extend_message_history(&mut event_messages, &mut tool_call_names, &result.events);
-        let cursor = result
-            .cursor
-            .or_else(|| cached_entry.and_then(|entry| entry.cursor));
-
-        self.history_cache
-            .write()
-            .expect(HISTORY_CACHE_NAME)
-            .insert(
-                conversation_id,
-                HistoryCacheEntry {
-                    cursor,
-                    messages: event_messages.clone(),
-                    tool_call_names,
-                },
-            );
-
         let mut messages = instructions.to_vec();
-        messages.extend(event_messages);
+        messages.extend(materialize_event_history(conversation, &self.history_cache).await?);
         Ok(messages)
     }
+}
 
+pub async fn materialize_event_history(
+    conversation: &dyn ConversationHandle,
+    cache: &RwLock<HashMap<ConversationId, HistoryCacheEntry>>,
+) -> Result<Vec<Message>> {
+    let conversation_id = conversation.record().id;
+    let cached_entry = {
+        let cache = cache.read().expect(HISTORY_CACHE_NAME);
+        cache.get(&conversation_id).cloned()
+    };
+
+    let result = conversation
+        .get_events(Some(EventQuery {
+            cursor: cached_entry.as_ref().and_then(|entry| entry.cursor),
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![
+                EventKind::MESSAGES,
+                EventKind::TOOL_REQUESTED,
+                EventKind::TOOL_RESULT,
+            ]),
+        }))
+        .await?;
+
+    let mut event_messages = cached_entry
+        .as_ref()
+        .map_or_else(Vec::new, |entry| entry.messages.clone());
+    let mut tool_call_names = cached_entry
+        .as_ref()
+        .map_or_else(HashMap::new, |entry| entry.tool_call_names.clone());
+    extend_message_history(&mut event_messages, &mut tool_call_names, &result.events);
+    let cursor = result
+        .cursor
+        .or_else(|| cached_entry.and_then(|entry| entry.cursor));
+
+    cache.write().expect(HISTORY_CACHE_NAME).insert(
+        conversation_id,
+        HistoryCacheEntry {
+            cursor,
+            messages: event_messages.clone(),
+            tool_call_names,
+        },
+    );
+
+    Ok(event_messages)
+}
+
+impl<M, T> BasicExecutor<M, T>
+where
+    M: ModelClient + 'static,
+    T: ToolRuntime + 'static,
+{
     async fn run_turn_loop(
         &self,
         agent: &dyn AgentHandle,
@@ -146,12 +156,21 @@ where
             let messages = self
                 .materialize_prompt_history(conversation, &agent_config.instructions)
                 .await?;
-            let request =
-                build_model_request(conversation, agent_config, conversation_config, messages)
-                    .await?;
-            let response = self
-                .complete_model_round(request, round as usize, stream_mode, turn_trace)
-                .await?;
+            let request = build_model_request(
+                conversation,
+                agent_config,
+                messages,
+                build_tool_definitions(conversation_config),
+            )
+            .await?;
+            let response = complete_model_round(
+                &*self.model,
+                request,
+                round as usize,
+                stream_mode,
+                turn_trace,
+            )
+            .await?;
 
             let events = interpret_model_response(response, &self.pricing);
             turn.add_events(events.clone()).await?;
@@ -181,113 +200,119 @@ where
 
         Ok(())
     }
+}
 
-    async fn complete_model_round(
-        &self,
-        request: ModelRequest,
-        round: usize,
-        stream_mode: ExecutorStreamMode<'_>,
-        turn_trace: Option<&dyn TurnExecutionTrace>,
-    ) -> Result<ModelResponse> {
-        let llm_trace = match turn_trace {
-            Some(turn_trace) => turn_trace.start_llm_round(&request, round).await,
-            None => None,
-        };
-        let requested_model = request.model.clone();
+pub async fn complete_model_round<M: ModelClient>(
+    model: &M,
+    request: ModelRequest,
+    round: usize,
+    stream_mode: ExecutorStreamMode<'_>,
+    turn_trace: Option<&dyn TurnExecutionTrace>,
+) -> Result<ModelResponse> {
+    let llm_trace = match turn_trace {
+        Some(turn_trace) => turn_trace.start_llm_round(&request, round).await,
+        None => None,
+    };
+    let requested_model = request.model.clone();
 
-        match stream_mode {
-            ExecutorStreamMode::Disabled => {
-                let started_at = Instant::now();
-                let response = match self.model.complete(request).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        if let Some(llm_trace) = llm_trace {
-                            llm_trace.finish_error(&error).await;
-                        }
-                        return Err(error);
+    match stream_mode {
+        ExecutorStreamMode::Disabled => {
+            let started_at = Instant::now();
+            let response = match model.complete(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(llm_trace) = llm_trace {
+                        llm_trace.finish_error(&error).await;
                     }
-                };
-                let duration = started_at.elapsed();
-                let mut response = response;
-                if response.model.is_none() {
-                    response.model = Some(requested_model);
+                    return Err(error);
                 }
-                if response.duration.is_none() {
-                    response.duration = Some(duration);
-                }
-                if let Some(llm_trace) = llm_trace {
-                    llm_trace.finish_success(&response, None).await;
-                }
-                Ok(response)
+            };
+            let duration = started_at.elapsed();
+            let mut response = response;
+            if response.model.is_none() {
+                response.model = Some(requested_model);
             }
-            ExecutorStreamMode::Enabled(event_tx) => {
-                let started_at = Instant::now();
-                let mut stream = match self.model.complete_stream(request).await {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        if let Some(llm_trace) = llm_trace {
-                            llm_trace.finish_error(&error).await;
-                        }
-                        return Err(error);
-                    }
-                };
-                let mut ttft = None;
-                loop {
-                    let chunk = match stream.next_chunk().await {
-                        Ok(chunk) => chunk,
-                        Err(error) => {
-                            if let Some(llm_trace) = llm_trace {
-                                llm_trace.finish_error(&error).await;
-                            }
-                            return Err(error);
-                        }
-                    };
-                    let Some(chunk) = chunk else {
-                        break;
-                    };
-                    if chunk.is_keep_alive() {
-                        continue;
-                    }
-                    if ttft.is_none() {
-                        let measured_ttft = started_at.elapsed();
-                        ttft = Some(measured_ttft);
-                        try_send_stream_event(
-                            event_tx,
-                            ExecutionStreamEvent::FirstChunk {
-                                ttft: measured_ttft,
-                            },
-                        );
-                    }
-                    try_send_stream_event(event_tx, ExecutionStreamEvent::Chunk(chunk));
-                }
-                let response = match stream.finish().await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        if let Some(llm_trace) = llm_trace {
-                            llm_trace.finish_error(&error).await;
-                        }
-                        return Err(error);
-                    }
-                };
-                let duration = started_at.elapsed();
-                let mut response = response;
-                if response.model.is_none() {
-                    response.model = Some(requested_model);
-                }
-                if response.ttft.is_none() {
-                    response.ttft = ttft;
-                }
-                if response.duration.is_none() {
-                    response.duration = Some(duration);
-                }
-                if let Some(llm_trace) = llm_trace {
-                    llm_trace.finish_success(&response, ttft).await;
-                }
-                Ok(response)
+            if response.duration.is_none() {
+                response.duration = Some(duration);
             }
+            if let Some(llm_trace) = llm_trace {
+                llm_trace.finish_success(&response, None).await;
+            }
+            Ok(response)
+        }
+        ExecutorStreamMode::Enabled(event_tx) => {
+            let started_at = Instant::now();
+            let mut stream = match model.complete_stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if let Some(llm_trace) = llm_trace {
+                        llm_trace.finish_error(&error).await;
+                    }
+                    return Err(error);
+                }
+            };
+            let mut ttft = None;
+            loop {
+                let chunk = match stream.next_chunk().await {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        if let Some(llm_trace) = llm_trace {
+                            llm_trace.finish_error(&error).await;
+                        }
+                        return Err(error);
+                    }
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                if chunk.is_keep_alive() {
+                    continue;
+                }
+                if ttft.is_none() {
+                    let measured_ttft = started_at.elapsed();
+                    ttft = Some(measured_ttft);
+                    try_send_stream_event(
+                        event_tx,
+                        ExecutionStreamEvent::FirstChunk {
+                            ttft: measured_ttft,
+                        },
+                    );
+                }
+                try_send_stream_event(event_tx, ExecutionStreamEvent::Chunk(chunk));
+            }
+            let response = match stream.finish().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(llm_trace) = llm_trace {
+                        llm_trace.finish_error(&error).await;
+                    }
+                    return Err(error);
+                }
+            };
+            let duration = started_at.elapsed();
+            let mut response = response;
+            if response.model.is_none() {
+                response.model = Some(requested_model);
+            }
+            if response.ttft.is_none() {
+                response.ttft = ttft;
+            }
+            if response.duration.is_none() {
+                response.duration = Some(duration);
+            }
+            if let Some(llm_trace) = llm_trace {
+                llm_trace.finish_success(&response, ttft).await;
+            }
+            Ok(response)
         }
     }
+}
 
+impl<M, T> BasicExecutor<M, T>
+where
+    M: ModelClient + 'static,
+    T: ToolRuntime + 'static,
+{
     async fn execute_tool_round(
         &self,
         context: ToolRoundContext<'_>,
@@ -483,7 +508,7 @@ fn remove_pending_tool_call(pending_tool_call_ids: &mut Vec<ToolCallId>, tool_ca
     }
 }
 
-fn interpret_model_response(response: ModelResponse, pricing: &PricingTable) -> Vec<EventData> {
+pub fn interpret_model_response(response: ModelResponse, pricing: &PricingTable) -> Vec<EventData> {
     let mut events = Vec::new();
 
     if !response.messages.is_empty() {
@@ -569,12 +594,12 @@ fn build_usage_record(
 }
 
 #[derive(Debug, Clone)]
-struct ExecutableToolRequest {
-    tool_call_id: String,
-    request: ToolRequest,
+pub struct ExecutableToolRequest {
+    pub tool_call_id: String,
+    pub request: ToolRequest,
 }
 
-fn collect_tool_requests(events: &[EventData]) -> Vec<ExecutableToolRequest> {
+pub fn collect_tool_requests(events: &[EventData]) -> Vec<ExecutableToolRequest> {
     events
         .iter()
         .filter_map(|event| match event {
@@ -591,11 +616,11 @@ fn collect_tool_requests(events: &[EventData]) -> Vec<ExecutableToolRequest> {
         .collect()
 }
 
-async fn build_model_request(
+pub async fn build_model_request(
     conversation: &dyn ConversationHandle,
     agent_config: &AgentConfig,
-    conversation_config: &ConversationConfig,
     messages: Vec<Message>,
+    tools: Vec<ToolDefinition>,
 ) -> Result<ModelRequest> {
     let model_binding = resolve_model_binding(conversation, &agent_config.model).await?;
     Ok(ModelRequest {
@@ -603,7 +628,7 @@ async fn build_model_request(
         api_key: model_binding.api_key,
         base_url: model_binding.base_url,
         messages,
-        tools: build_tool_definitions(conversation_config),
+        tools,
         max_output_tokens: agent_config.max_output_tokens,
     })
 }
@@ -633,7 +658,7 @@ fn build_tool_definitions(config: &ConversationConfig) -> Vec<ToolDefinition> {
 }
 
 #[derive(Debug, Clone, Default)]
-struct HistoryCacheEntry {
+pub struct HistoryCacheEntry {
     cursor: Option<EventId>,
     messages: Vec<Message>,
     tool_call_names: HashMap<ToolCallId, String>,

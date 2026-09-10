@@ -23,13 +23,13 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-pub(crate) enum ExecutorStreamMode<'a> {
+pub enum ExecutorStreamMode<'a> {
     Disabled,
     Enabled(&'a mpsc::UnboundedSender<Result<ExecutionStreamEvent>>),
 }
 
 #[async_trait]
-pub(crate) trait HarnessExecutor: Send + Sync + Clone + 'static {
+pub trait HarnessExecutor: Send + Sync + Clone + 'static {
     type Prepared: Send + Sync + 'static;
 
     async fn prepare_conversation(
@@ -57,7 +57,7 @@ pub(crate) trait HarnessExecutor: Send + Sync + Clone + 'static {
     ) -> Result<()>;
 }
 
-pub(crate) struct ExecutorHarnessRuntime<E> {
+pub struct ExecutorHarnessRuntime<E> {
     executor: E,
     tracer: Arc<dyn ExecutionTracer>,
     agent_config_cache: Arc<RwLock<HashMap<exoharness::AgentId, AgentConfig>>>,
@@ -65,7 +65,7 @@ pub(crate) struct ExecutorHarnessRuntime<E> {
 }
 
 impl<E> ExecutorHarnessRuntime<E> {
-    pub(crate) fn new(executor: E, runtime_config: Option<BraintrustRuntimeConfig>) -> Self {
+    pub fn new(executor: E, runtime_config: Option<BraintrustRuntimeConfig>) -> Self {
         Self {
             executor,
             tracer: Arc::new(BraintrustTracer::new(runtime_config)),

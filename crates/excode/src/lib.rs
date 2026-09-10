@@ -6,6 +6,10 @@ mod sandbox_pool;
 mod snapshot_store;
 
 pub use agent::{CodingAgent, CodingAgentConfig, CodingAgentEvent, CodingResult, CodingTask};
+pub use agent::{
+    CodingExecutor, CodingHarness, CodingToolRuntime, ContextProjection, ToolContext, ToolHandler,
+    ToolRegistry,
+};
 pub use recipe::{
     CreateSandboxFromRecipeRequest, RecipePolicy, RecipeService, SandboxRecipe, SandboxRecipeStep,
     SecretResolver,

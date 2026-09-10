@@ -43,7 +43,7 @@ pub(crate) struct ConversationSandboxSpec {
     pub(crate) idle_seconds: u64,
 }
 
-pub(crate) async fn ensure_conversation_sandbox(
+pub async fn ensure_conversation_sandbox(
     conversation: &dyn ConversationHandle,
     agent_config: &AgentConfig,
     config: &ConversationConfig,
