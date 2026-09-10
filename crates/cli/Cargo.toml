@@ -19,6 +19,8 @@ anyhow.workspace = true
 clap.workspace = true
 cost = { path = "../cost" }
 crossterm.workspace = true
+excode = { path = "../excode" }
+exoharness = { path = "../exoharness", features = ["basic-backend"] }
 executor = { path = "../executor" }
 lingua.workspace = true
 ratatui.workspace = true

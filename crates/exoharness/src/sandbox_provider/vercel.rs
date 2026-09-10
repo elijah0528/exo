@@ -71,6 +71,7 @@ impl VercelSandboxBackend {
     async fn get_sandbox_session(
         &self,
         name: &str,
+        resume: bool,
     ) -> Result<Option<VercelSandboxSessionResponse>> {
         let response = self
             .client
@@ -78,7 +79,7 @@ impl VercelSandboxBackend {
             .query(&[
                 ("teamId", self.team_id.as_str()),
                 ("projectId", self.project_id.as_str()),
-                ("resume", "true"),
+                ("resume", if resume { "true" } else { "false" }),
             ])
             .send()
             .await
@@ -163,7 +164,7 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         reject_unsupported_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
-        let response = match self.get_sandbox_session(&sandbox_name).await? {
+        let response = match self.get_sandbox_session(&sandbox_name, true).await? {
             Some(existing) => existing,
             None => {
                 self.create_sandbox(&request, &sandbox_name, &spec_hash)
@@ -194,6 +195,17 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         _payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("restoring a Vercel sandbox from a snapshot is not implemented yet");
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
+        let Some(session) = self.get_sandbox_session(&sandbox_name, false).await? else {
+            return Ok(());
+        };
+        stop_session(&self.handle_backend(), &session.session.id)
+            .await
+            .with_context(|| format!("terminating Vercel sandbox {sandbox_name}"))
     }
 }
 
