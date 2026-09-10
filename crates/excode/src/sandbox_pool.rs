@@ -225,7 +225,8 @@ pub struct LocalSandboxPool {
     policy: PoolPolicy,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
     capacity: PoolCapacity,
-    notify: Arc<Notify>,
+    /// Woken whenever the entry table changes, both for waiters in
+    /// [`Self::acquire`] and for the reconciler.
     changed: Arc<Notify>,
     reconcile: Mutex<()>,
     closed: AtomicBool,
@@ -346,7 +347,6 @@ impl LocalSandboxPool {
             policy,
             entries: Arc::new(Mutex::new(HashMap::new())),
             capacity,
-            notify: Arc::new(Notify::new()),
             changed: Arc::new(Notify::new()),
             reconcile: Mutex::new(()),
             closed: AtomicBool::new(false),
@@ -391,7 +391,6 @@ impl LocalSandboxPool {
             bail!("sandbox pool entry already exists: {}", entry.id);
         }
         entries.insert(entry.id.clone(), entry);
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(())
     }
@@ -466,7 +465,6 @@ impl LocalSandboxPool {
             entry.snapshot_id = Some(snapshot_id);
             entry.dirty = false;
         }
-        self.notify.notify_one();
         self.changed.notify_waiters();
         let leased = LeasedSandbox {
             lease: lease.clone(),
@@ -474,7 +472,6 @@ impl LocalSandboxPool {
             command_timeout: self.policy.command_timeout,
             entries: Arc::clone(&self.entries),
             lifecycle: Arc::clone(&lifecycle),
-            notify: Arc::clone(&self.notify),
             changed: Arc::clone(&self.changed),
         };
         Ok((lease, leased))
@@ -544,7 +541,6 @@ impl LocalSandboxPool {
                 Err(error) if error.is::<NoReadyCapacity>() => {}
                 Err(error) => return Err(error),
             }
-            self.notify.notify_one();
             changed.await;
         }
     }
@@ -605,7 +601,6 @@ impl LocalSandboxPool {
             }
         };
 
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(snapshot_id)
     }
@@ -628,7 +623,6 @@ impl LocalSandboxPool {
         }
 
         self.entries.lock().await.remove(&entry_id);
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(())
     }
@@ -699,7 +693,7 @@ impl LocalSandboxPool {
                 entry.state = PoolEntryState::Retiring;
                 entry.last_health_check_at = Some(Instant::now());
             }
-            self.notify.notify_one();
+            self.changed.notify_waiters();
             return Err(error);
         }
 
@@ -754,30 +748,33 @@ impl LocalSandboxPool {
 
         loop {
             if *shutdown.borrow() {
-                self.closed.store(true, Ordering::Release);
-                self.changed.notify_waiters();
+                self.close();
                 return;
             }
+            // Subscribe before reconciling so a change made during the pass
+            // wakes the next one instead of being missed.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Err(error) = self.reconcile_once().await {
+                tracing::warn!(%error, "sandbox pool reconciliation failed");
+            }
             tokio::select! {
-                _ = self.notify.notified() => {
-                    if let Err(error) = self.reconcile_once().await {
-                        tracing::warn!(%error, "sandbox pool reconciliation failed");
-                    }
-                }
-                _ = interval.tick() => {
-                    if let Err(error) = self.reconcile_once().await {
-                        tracing::warn!(%error, "sandbox pool reconciliation failed");
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        self.closed.store(true, Ordering::Release);
-                        self.changed.notify_waiters();
+                _ = changed => {}
+                _ = interval.tick() => {}
+                shutdown_changed = shutdown.changed() => {
+                    if shutdown_changed.is_err() || *shutdown.borrow() {
+                        self.close();
                         return;
                     }
                 }
             }
         }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
     }
 
     async fn evict_idle(&self) -> Result<()> {
@@ -880,7 +877,6 @@ impl LocalSandboxPool {
                     return Err(error);
                 }
             }
-            self.notify.notify_one();
             self.changed.notify_waiters();
         }
     }
@@ -929,7 +925,6 @@ impl LocalSandboxPool {
             return Err(error);
         }
         self.entries.lock().await.remove(entry_id);
-        self.notify.notify_one();
         self.changed.notify_waiters();
         Ok(())
     }
@@ -1089,7 +1084,6 @@ impl LocalSandboxPool {
         if let Some(entry) = entries.get_mut(entry_id) {
             quarantine_entry(entry);
         }
-        self.notify.notify_one();
         self.changed.notify_waiters();
     }
 
@@ -1101,7 +1095,6 @@ impl LocalSandboxPool {
             entry.state = PoolEntryState::Retiring;
             entry.lease = None;
             entry.handle = None;
-            self.notify.notify_one();
             self.changed.notify_waiters();
         }
     }
@@ -1139,7 +1132,6 @@ struct LeasedSandbox {
     command_timeout: Duration,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
     lifecycle: Arc<RwLock<()>>,
-    notify: Arc<Notify>,
     changed: Arc<Notify>,
 }
 
@@ -1193,7 +1185,6 @@ impl LeasedSandbox {
             true
         };
         if quarantined {
-            self.notify.notify_one();
             self.changed.notify_waiters();
         }
     }
