@@ -13,6 +13,12 @@ use tokio::sync::Mutex;
 
 use exoharness::{Result, SnapshotFormat, SnapshotId, SnapshotPayload, Uuid7};
 
+const MANIFEST_FILE: &str = "manifest.json";
+const PAYLOAD_FILE: &str = "payload.bin";
+/// Directories that are still being written are hidden behind this prefix and
+/// published with a rename.
+const TEMPORARY_PREFIX: &str = ".tmp-";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SnapshotRetentionPolicy {
     pub idle_ttl: Option<Duration>,
@@ -122,7 +128,7 @@ impl LocalSandboxPoolStore {
             for owner in directories(&pool).await? {
                 for directory in directories(&owner).await? {
                     records.push(SnapshotRecord {
-                        manifest: read_manifest(&directory.join("manifest.json")).await?,
+                        manifest: read_manifest(&directory.join(MANIFEST_FILE)).await?,
                         directory,
                     });
                 }
@@ -140,7 +146,10 @@ impl LocalSandboxPoolStore {
                 let mut entries = fs::read_dir(&owner).await?;
                 while let Some(entry) = entries.next_entry().await? {
                     if entry.file_type().await?.is_dir()
-                        && entry.file_name().to_string_lossy().starts_with(".tmp-")
+                        && entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(TEMPORARY_PREFIX)
                     {
                         fs::remove_dir_all(entry.path()).await?;
                     }
@@ -165,15 +174,15 @@ impl SandboxPoolSnapshotStore for LocalSandboxPoolStore {
         let owner_directory = self.owner_directory(pool_id, owner_id);
         if fs::try_exists(&owner_directory).await? {
             for directory in directories(&owner_directory).await? {
-                let mut manifest = read_manifest(&directory.join("manifest.json")).await?;
+                let mut manifest = read_manifest(&directory.join(MANIFEST_FILE)).await?;
                 if manifest.content_hash == payload_hash {
                     manifest.last_accessed_at_ms = now_ms();
-                    write_manifest(&directory.join("manifest.json"), &manifest).await?;
+                    write_manifest(&directory.join(MANIFEST_FILE), &manifest).await?;
                     return Ok(manifest.snapshot_id);
                 }
             }
         }
-        let temporary = owner_directory.join(format!(".tmp-{snapshot_id}"));
+        let temporary = owner_directory.join(format!("{TEMPORARY_PREFIX}{snapshot_id}"));
         let directory = owner_directory.join(snapshot_id.to_string());
         fs::create_dir_all(&owner_directory).await?;
         fs::create_dir(&temporary).await?;
@@ -186,8 +195,8 @@ impl SandboxPoolSnapshotStore for LocalSandboxPoolStore {
             last_accessed_at_ms: now_ms(),
         };
         let result = async {
-            write_manifest(&temporary.join("manifest.json"), &manifest).await?;
-            fs::write(temporary.join("payload.bin"), &payload.bytes).await?;
+            write_manifest(&temporary.join(MANIFEST_FILE), &manifest).await?;
+            fs::write(temporary.join(PAYLOAD_FILE), &payload.bytes).await?;
             fs::rename(&temporary, directory).await?;
             Ok::<(), anyhow::Error>(())
         }
@@ -213,13 +222,13 @@ impl SandboxPoolSnapshotStore for LocalSandboxPoolStore {
     ) -> Result<SnapshotPayload> {
         let _operation = self.operation.lock().await;
         let directory = self.snapshot_directory(pool_id, owner_id, snapshot_id);
-        let manifest_path = directory.join("manifest.json");
+        let manifest_path = directory.join(MANIFEST_FILE);
         let mut manifest = read_manifest(&manifest_path).await?;
         if manifest.snapshot_id != snapshot_id {
             bail!("snapshot manifest id does not match requested snapshot");
         }
 
-        let bytes = Bytes::from(fs::read(directory.join("payload.bin")).await?);
+        let bytes = Bytes::from(fs::read(directory.join(PAYLOAD_FILE)).await?);
         if bytes.len() as u64 != manifest.size_bytes {
             bail!("snapshot payload size does not match its manifest");
         }
@@ -244,7 +253,7 @@ impl SandboxPoolSnapshotStore for LocalSandboxPoolStore {
 
         let mut snapshots = Vec::new();
         for directory in directories(&owner_directory).await? {
-            let manifest = read_manifest(&directory.join("manifest.json")).await?;
+            let manifest = read_manifest(&directory.join(MANIFEST_FILE)).await?;
             snapshots.push(SandboxPoolSnapshotView {
                 owner_id: owner_id.to_string(),
                 snapshot_id: manifest.snapshot_id,
@@ -407,7 +416,7 @@ mod tests {
         fs::write(
             store
                 .snapshot_directory("pool", "owner", snapshot_id)
-                .join("payload.bin"),
+                .join(PAYLOAD_FILE),
             b"modified",
         )
         .await
