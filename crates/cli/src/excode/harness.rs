@@ -23,7 +23,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     HarnessSelection, build_typescript_harness_config, ensure_agent_matches_harness_selection,
-    ensure_existing_repl_agent_model, ensure_repl_model,
+    ensure_existing_repl_agent_model, ensure_repl_model, format_harness_selection,
 };
 
 use super::args::{ExcodeArgs, PoolBackend};
@@ -58,6 +58,12 @@ impl HarnessChatDriver {
                 "excode --harness accepts codex, claude-code, cursor, pi, or a TypeScript harness module path"
             );
         }
+        // Resolve the module path before touching models so a bad path errors
+        // clearly instead of being masked by model-registration checks.
+        let typescript =
+            build_typescript_harness_config(Some(selection), None, &[]).with_context(|| {
+                format!("invalid --harness {}", format_harness_selection(selection))
+            })?;
         let workspace_root =
             std::env::current_dir().context("determining the TypeScript workspace root")?;
         if !workspace_root
@@ -105,7 +111,7 @@ impl HarnessChatDriver {
                         slug: agent_slug.clone(),
                         name: Some(agent_slug),
                         harness: AgentHarnessKind::TypeScript,
-                        typescript: build_typescript_harness_config(Some(selection), None, &[])?,
+                        typescript: typescript.clone(),
                         enable_agent_tool_creation: false,
                         sandbox_image: selection
                             .default_sandbox_image()
