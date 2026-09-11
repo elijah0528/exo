@@ -10,7 +10,7 @@ members = [
   "exo/scheduler-runner",
 ]
 resolver = "2"
-exclude = ["fuzz"]
+exclude = ["fuzz", "codex"]
 
 [workspace.package]
 edition = "2024"

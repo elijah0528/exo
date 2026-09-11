@@ -683,8 +683,10 @@ where
     let started = Instant::now();
     let mut completed = None;
     loop {
-        if completed.is_some() && started.elapsed() >= Duration::from_secs(1) {
-            return completed.expect("completed activity operation");
+        if started.elapsed() >= Duration::from_secs(1)
+            && let Some(result) = completed
+        {
+            return result;
         }
         tokio::select! {
             result = &mut operation, if completed.is_none() => completed = Some(result),
