@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+cost = { path = "../cost" }
 exoharness = { path = "../exoharness", features = ["basic-backend"] }
 executor = { path = "../executor" }
 futures.workspace = true

@@ -891,7 +891,7 @@ async fn execute_shell_tool(
     read_shell_process(process).await
 }
 
-async fn read_shell_process(process: Box<dyn SandboxProcess>) -> Result<ToolResult> {
+pub async fn read_shell_process(process: Box<dyn SandboxProcess>) -> Result<ToolResult> {
     let parts = process.into_parts();
     let mut stdout = parts.stdout;
     let mut stderr = parts.stderr;
@@ -945,7 +945,7 @@ async fn execute_exo_shell_tool(
     read_shell_process(process).await
 }
 
-pub(crate) async fn ensure_shell_sandbox(
+pub async fn ensure_shell_sandbox(
     conversation: &dyn ConversationHandle,
     agent_config: &AgentConfig,
     config: &ConversationConfig,

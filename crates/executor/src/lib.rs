@@ -46,7 +46,9 @@ pub use conversation_events::{
     HOST_EVENT_REBUILD_AND_RESTART, RebuildUpdateRecord, complete_rebuild_and_restart_update,
     finalize_rebuild_update_file, record_host_event,
 };
+pub use conversation_sandbox::ensure_conversation_sandbox;
 pub use conversation_wakeup::send_conversation_wakeup;
+pub use execution_tracing::{LlmExecutionTrace, ToolExecutionTrace, TurnExecutionTrace};
 pub use executor_types::{
     AgentConfig, AgentHarnessKind, AgentSandboxConfig, ConversationConfig, ConversationModelConfig,
     ExecutionStreamEvent, ExecutionStreamHandle, ModelClient, ModelRequest, ModelResponse,
@@ -78,8 +80,12 @@ pub use exoharness::{
 };
 pub use harness_basic::BasicHarness;
 pub use harness_config::load_agent_config;
+pub use harness_executor::{ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor};
+pub use harness_facade::{SharedHarness, SharedHarnessBacked};
 pub use harness_runtime::RouterModelClient;
-pub use harness_tool::{BasicToolRuntime, ExoToolRuntime};
+pub use harness_tool::{
+    BasicToolRuntime, ExoToolRuntime, ensure_shell_sandbox, read_shell_process,
+};
 pub use harness_types::{
     CreateAgentRequest, CreateConversationRequest, Harness, HarnessAgent, HarnessConversation,
 };
@@ -94,6 +100,11 @@ pub use scheduler_types::{
     MissedPolicy, NewScheduledTask, ScheduledFireRecord, ScheduledTaskRecord,
     ScheduledTaskRunRecord, now_ms,
 };
+pub use shared::try_send_stream_event;
 pub use typescript::TypeScriptHarness;
 
 pub(crate) use basic::BasicExecutor;
+pub use basic::{
+    ExecutableToolRequest, HistoryCacheEntry, build_model_request, collect_tool_requests,
+    complete_model_round, interpret_model_response, materialize_event_history,
+};

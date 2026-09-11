@@ -59,6 +59,7 @@ pub enum AgentHarnessKind {
     #[serde(rename = "typescript")]
     TypeScript,
     Exo,
+    Coding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

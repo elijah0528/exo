@@ -18,7 +18,7 @@ use crate::harness_types::{
 };
 
 #[async_trait]
-pub(crate) trait HarnessRuntime: Send + Sync + Clone + 'static {
+pub trait HarnessRuntime: Send + Sync + Clone + 'static {
     async fn get_agent_config(&self, agent: &dyn AgentHandle) -> Result<AgentConfig>;
     async fn put_agent_config(&self, agent: &dyn AgentHandle, config: AgentConfig) -> Result<()>;
     async fn get_conversation_config(
@@ -45,7 +45,7 @@ pub(crate) trait HarnessRuntime: Send + Sync + Clone + 'static {
     async fn flush_tracing(&self) -> Result<()>;
 }
 
-pub(crate) trait SharedHarnessBacked: Send + Sync {
+pub trait SharedHarnessBacked: Send + Sync {
     type Runtime: HarnessRuntime;
 
     fn shared_harness(&self) -> &SharedHarness<Self::Runtime>;
@@ -81,7 +81,7 @@ where
     }
 }
 
-pub(crate) struct SharedHarness<R> {
+pub struct SharedHarness<R> {
     exoharness: Arc<dyn ExoHarness>,
     runtime: R,
 }
@@ -90,7 +90,7 @@ impl<R> SharedHarness<R>
 where
     R: HarnessRuntime,
 {
-    pub(crate) fn new(exoharness: Arc<dyn ExoHarness>, runtime: R) -> Self {
+    pub fn new(exoharness: Arc<dyn ExoHarness>, runtime: R) -> Self {
         Self {
             exoharness,
             runtime,
