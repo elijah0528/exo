@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 cost = { path = "../cost" }
 crossterm.workspace = true

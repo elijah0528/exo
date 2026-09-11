@@ -2,6 +2,7 @@ mod adapters;
 mod env;
 #[cfg(test)]
 mod env_tests;
+mod excode;
 #[cfg(test)]
 mod mount_tests;
 #[cfg(test)]
@@ -9,7 +10,6 @@ mod naming_tests;
 mod render;
 #[cfg(test)]
 mod repl_tests;
-mod sandbox_pool_tui;
 #[cfg(test)]
 mod secret_tests;
 mod tools;
@@ -589,7 +589,12 @@ enum Commands {
     /// Inspect and operate a managed sandbox pool in a terminal UI.
     SandboxPool {
         #[command(flatten)]
-        args: sandbox_pool_tui::SandboxPoolArgs,
+        args: excode::ExcodeArgs,
+    },
+    /// The excode terminal: sandbox pool, coding agent, and diffs.
+    Excode {
+        #[command(flatten)]
+        args: excode::ExcodeArgs,
     },
     /// Manage local stored secrets.
     Secret {
@@ -1206,11 +1211,15 @@ async fn main() -> Result<()> {
         #[cfg(not(feature = "firecracker"))]
         bail!("Firecracker bridge support requires building Exo with --features firecracker");
     }
+    let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
+    let env_vars = env.clone().into_vars();
     if let Commands::SandboxPool { args } = &cli.command {
-        return sandbox_pool_tui::run(&cli.root, args.clone()).await;
+        return excode::run(&cli.root, args.clone(), env_vars).await;
+    }
+    if let Commands::Excode { args } = &cli.command {
+        return excode::run(&cli.root, args.clone(), env_vars).await;
     }
     let exo_config = build_exo_config(&cli)?;
-    let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
     let runtime_config = env.braintrust_runtime_config(
         cli.braintrust_api_key,
         cli.braintrust_app_url,
@@ -1264,6 +1273,9 @@ async fn main() -> Result<()> {
         }
         Commands::SandboxPool { .. } => {
             unreachable!("sandbox pool returns before harness startup")
+        }
+        Commands::Excode { .. } => {
+            unreachable!("excode returns before harness startup")
         }
         Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
@@ -2979,6 +2991,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         Commands::Secret { .. }
         | Commands::FirecrackerBridge
         | Commands::SandboxPool { .. }
+        | Commands::Excode { .. }
         | Commands::Sandbox { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
