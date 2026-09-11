@@ -63,14 +63,45 @@ access) resolves to methods on these three traits.
 These are the exoharness-like components to virtualize onto conversations,
 events, artifacts, bindings, and secrets.
 
-### 3. Semantic primitives (stay in codex — executor domain)
+### 3. Conversation primitives (the parallel data model)
 
-Per the spec, anything semantic belongs to the executor: thread/turn
-orchestration, prompt assembly, compaction (`new_context_window`),
-approvals policy and UX, `plan`/`update_plan`, `tool_search`, MCP client
-connections (`codex-mcp`/`rmcp-client`), `multi_agents` subagent spawning,
-plugins. Codex keeps these; we only want their *outputs* to land in
-exoharness (e.g. record approval decisions and tool activity as events).
+Codex's app-server exposes a full conversation surface that lines up with
+the exoharness data model almost one-to-one:
+
+| codex (app-server v2) | exoharness |
+|---|---|
+| `thread/start` | `new_conversation` (per `ThreadStartParams.environments` → sandbox scope) |
+| `thread/resume` | `get_conversation` + materialize prompt state from events (replaces rollout-file hydration) |
+| `thread/fork` | `conversation.fork` — and unlike codex, a paired `fork_sandbox` rewinds the *filesystem* too |
+| `thread/rollback` / `thread/revert` | `conversation.fork(up_to_inclusive)` — codex's own docs note rollback "does not revert local file changes"; exo time travel rewinds history **and** sandbox state |
+| `thread/archive`/`unarchive`/`delete`, `name/set`, `metadata/update` | conversation record fields / `delete_conversation` (may need an `update_conversation` request — gap) |
+| `thread/list` / `thread/read` / `thread/search*` | `list_conversations`, `get_events` + materialize; search is executor-side over events |
+| live session (opening a thread) | `start_session` / `end_session` |
+| `turn/start` | `begin_turn` |
+| `turn/completed` | `turn.finish` |
+| `turn/steer` (mid-turn input) | `turn.add_events` (injects into the active turn's log) — needs codex-side plumbing to surface it as a user item |
+| `turn/interrupt` | gap — no turn-cancel request yet; today approximated by `cancel_sandbox_process` on in-flight calls |
+| `thread/inject_items` | `add_events` / materialized-history → prompt items (what `codex-harness.ts` already does on cold start) |
+| `thread/items|turns|timeline/list` | `get_events` with type filters |
+| `thread/compact/start` | stays executor-side; the summary/derived view is stored as a custom event pointing at an artifact, per `spec.md` |
+| `thread/queue/*`, `goal/*`, `section*`, `memoryMode`, `backgroundTerminals/*` | custom events + artifacts on the conversation (queue/goals are just durable state) |
+| `project/*` (thread grouping by workspace) | agent + naming convention on conversations, or a lightweight project object if we add one |
+| rollout `ResponseItem`s + sqlite `state/` rows | `Event`s — `messages`, `tool_requested`, `tool_result`, `codex_*` custom types |
+
+The deep version of this — codex's rollout/state stores *replaced* by the
+exoharness event log rather than mirrored into it — is the fork-level work
+in Phase 4. The cheap version ships earlier: `CODEX_HOME` on a durable
+filesystem keeps rollouts persistent, while the harness/bridge mirrors
+items into events so exo remains the queryable canonical record.
+
+### 4. Semantic primitives (stay in codex — executor domain)
+
+Per the spec, anything semantic belongs to the executor: prompt assembly,
+compaction policy, approvals policy and UX, `plan`/`update_plan`,
+`tool_search`, MCP client connections (`codex-mcp`/`rmcp-client`),
+`multi_agents` subagent spawning, plugins, skills. Codex keeps these; we
+only want their *outputs* to land in exoharness (e.g. approval decisions
+and tool activity recorded as events).
 
 ## Target architecture
 
