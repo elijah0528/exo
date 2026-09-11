@@ -24,7 +24,7 @@ use super::args::PoolBackend;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SNAPSHOTS: usize = 20;
 const MAX_SNAPSHOT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const RECIPE_WORKDIR: &str = "/workspace/exo";
+pub(crate) const RECIPE_WORKDIR: &str = "/workspace/exo";
 
 /// Outcome of running a command inside the sandbox.
 #[derive(Debug, Clone)]

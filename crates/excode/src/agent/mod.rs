@@ -246,7 +246,9 @@ where
     }
 }
 
-fn stream_chunk_text(chunk: &lingua::UniversalStreamChunk) -> String {
+/// Extracts assistant text from a stream chunk shared by all executors that
+/// stream `UniversalStreamChunk`s.
+pub fn stream_chunk_text(chunk: &lingua::UniversalStreamChunk) -> String {
     let mut text = String::new();
     for choice in &chunk.choices {
         if let Some(delta) = choice.delta_view()

@@ -15,8 +15,7 @@ use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
-use excode::{CodingAgent, CodingAgentEvent, CodingResult};
-use executor::RouterModelClient;
+use excode::{CodingAgentEvent, CodingResult};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -26,6 +25,7 @@ use tokio_stream::StreamExt;
 use super::clipboard;
 use super::command::{COMMANDS, Command, parse};
 use super::dashboard::SnapshotList;
+use super::harness::ChatDriver;
 use super::session::Session;
 use super::ui::activity::Activity;
 use super::ui::cells::{
@@ -78,7 +78,7 @@ pub struct App {
     activity: Option<Activity>,
     focus: Focus,
     overlay: Option<Overlay>,
-    agent: CodingAgent<RouterModelClient>,
+    agent: ChatDriver,
     chat_task: Option<ChatTask>,
     chat_events: Option<UnboundedReceiver<CodingAgentEvent>>,
     streaming_cell: Option<Rc<RefCell<String>>>,
@@ -91,7 +91,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session: Session, agent: CodingAgent<RouterModelClient>) -> Self {
+    pub fn new(session: Session, agent: ChatDriver) -> Self {
         let mut app = Self {
             session,
             theme: Theme::dark(),
@@ -496,9 +496,14 @@ impl App {
         self.streamed_response = false;
         self.active_tool = None;
         self.chat_task = Some(tokio::spawn(async move {
-            agent
-                .run_on_lease_streaming(&lease, sandbox.as_ref(), &prompt, events)
-                .await
+            match agent {
+                ChatDriver::Builtin(agent) => {
+                    agent
+                        .run_on_lease_streaming(&lease, sandbox.as_ref(), &prompt, events)
+                        .await
+                }
+                ChatDriver::Harness(driver) => driver.run(&prompt, events).await,
+            }
         }));
     }
 
@@ -683,8 +688,10 @@ where
     let started = Instant::now();
     let mut completed = None;
     loop {
-        if completed.is_some() && started.elapsed() >= Duration::from_secs(1) {
-            return completed.expect("completed activity operation");
+        if started.elapsed() >= Duration::from_secs(1)
+            && let Some(result) = completed.take()
+        {
+            return result;
         }
         tokio::select! {
             result = &mut operation, if completed.is_none() => completed = Some(result),
