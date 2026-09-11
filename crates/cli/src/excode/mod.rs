@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use excode::{CodingAgent, CodingAgentConfig};
 use executor::RouterModelClient;
 
@@ -28,8 +28,15 @@ use crate::HarnessSelection;
 
 pub use args::ExcodeArgs;
 
-/// Start the pool, run the terminal, then drain the pool.
-pub async fn run(root: &Path, args: ExcodeArgs, env_vars: HashMap<String, String>) -> Result<()> {
+/// Start the pool, run the terminal, then drain the pool. `harness` selects an
+/// exoharness-backed chat driver (`--harness codex`, a TypeScript module path,
+/// ...); `None` keeps the built-in pool coding agent.
+pub async fn run(
+    root: &Path,
+    args: ExcodeArgs,
+    env_vars: HashMap<String, String>,
+    harness: Option<HarnessSelection>,
+) -> Result<()> {
     let session = session::Session::start(
         root,
         args.backend,
@@ -45,13 +52,10 @@ pub async fn run(root: &Path, args: ExcodeArgs, env_vars: HashMap<String, String
         async move { pool.run_reconciler(receiver).await }
     });
 
-    let agent = match &args.harness {
-        Some(raw) => {
-            let selection: HarnessSelection = raw.parse().map_err(|error| anyhow!("{error}"))?;
-            harness::ChatDriver::Harness(
-                harness::HarnessChatDriver::build(root, &selection, &args, env_vars).await?,
-            )
-        }
+    let agent = match &harness {
+        Some(selection) => harness::ChatDriver::Harness(
+            harness::HarnessChatDriver::build(root, selection, &args, env_vars).await?,
+        ),
         None => harness::ChatDriver::Builtin(CodingAgent::new(
             Arc::new(RouterModelClient::new(env_vars)),
             Arc::clone(&pool) as Arc<dyn excode::ManagedSandboxPool>,
