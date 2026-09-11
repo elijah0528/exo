@@ -24,8 +24,7 @@ pub fn coding_tool_definitions() -> Vec<ToolDefinition> {
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"]
+                "properties": { "path": { "type": "string" } }, "required": ["path"]
             }),
         },
         ToolDefinition {
